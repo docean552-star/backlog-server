@@ -1,0 +1,7 @@
+.env
+.env.*
+!.env.example
+bin/
+dist/
+*.log
+.DS_Store
