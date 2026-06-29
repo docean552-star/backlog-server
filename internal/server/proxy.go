@@ -42,9 +42,12 @@ const (
 var execAgentRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,50}$`)
 
 // ExecRequest is the JSON body for POST /exec.
+// `stdin`, if present, is piped into the subprocess as-is — used by hook-* commands
+// which receive a JSON event payload on stdin from the Claude Code hook protocol.
 type ExecRequest struct {
 	Agent string   `json:"agent"`
 	Argv  []string `json:"argv"`
+	Stdin string   `json:"stdin,omitempty"`
 }
 
 // ExecResponse mirrors what a local CLI invocation would have produced.
@@ -98,6 +101,9 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	var outBuf, errBuf bytes.Buffer
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf
+	if req.Stdin != "" {
+		cmd.Stdin = bytes.NewReader([]byte(req.Stdin))
+	}
 
 	runErr := cmd.Run()
 	resp := ExecResponse{
