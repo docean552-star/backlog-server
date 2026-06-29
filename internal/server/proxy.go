@@ -44,10 +44,21 @@ var execAgentRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,50}$`)
 // ExecRequest is the JSON body for POST /exec.
 // `stdin`, if present, is piped into the subprocess as-is — used by hook-* commands
 // which receive a JSON event payload on stdin from the Claude Code hook protocol.
+// `module` selects which Python module to run; defaults to "backlogist" for backward
+// compat. Other allowed: "pager".
 type ExecRequest struct {
-	Agent string   `json:"agent"`
-	Argv  []string `json:"argv"`
-	Stdin string   `json:"stdin,omitempty"`
+	Agent  string   `json:"agent"`
+	Argv   []string `json:"argv"`
+	Stdin  string   `json:"stdin,omitempty"`
+	Module string   `json:"module,omitempty"`
+}
+
+// Whitelist of Python modules the proxy is allowed to invoke. Lets us forward
+// pager + backlogist (and future packages) through the same endpoint without
+// turning /exec into an arbitrary-RCE for any X-Agent-Key holder.
+var execAllowedModules = map[string]bool{
+	"backlogist": true,
+	"pager":      true,
 }
 
 // ExecResponse mirrors what a local CLI invocation would have produced.
@@ -80,11 +91,20 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	module := req.Module
+	if module == "" {
+		module = "backlogist"
+	}
+	if !execAllowedModules[module] {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "module not allowed: " + module})
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), execTimeout)
 	defer cancel()
 
-	// Build argv: python -m backlogist <user argv...>
-	pyArgs := append([]string{"-m", "backlogist"}, req.Argv...)
+	// Build argv: python -m <module> <user argv...>
+	pyArgs := append([]string{"-m", module}, req.Argv...)
 	cmd := exec.CommandContext(ctx, execPython, pyArgs...)
 	cmd.Dir = execWorkDir
 	// Inherit server env (PATH, PG creds via .env loader inside Python) and override AX_AGENT
