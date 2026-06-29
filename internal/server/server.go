@@ -33,6 +33,7 @@ func New(cfg config.Config, st *store.Store) *Server {
 	r.Get("/task/{id}", s.handleGetTask)
 	r.Get("/next/{agent}", s.handleNext)
 	r.Get("/status", s.handleStatus)
+	r.Post("/exec", s.handleExec)
 
 	s.http = &http.Server{
 		Addr:              cfg.HTTPAddr,
