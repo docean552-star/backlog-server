@@ -29,11 +29,11 @@ import (
 const (
 	execTimeout    = 60 * time.Second
 	execMaxArgv    = 50
-	execMaxArgLen  = 500
+	execMaxArgLen  = 16 * 1024  // 16 KB per arg — pager messages can be multi-KB
 	execMaxOutSize = 256 * 1024 // 256 KB per stream
 	execWorkDir    = "/opt/apps/ax"
 	execPython     = "/opt/apps/ax/.venv-server/bin/python"
-	execMaxBodyB   = 64 * 1024
+	execMaxBodyB   = 1 * 1024 * 1024 // 1 MB total body (50 args × 16 KB + headers slack)
 )
 
 // Agent identifier is allowed to be only [A-Za-z0-9_-], 1..50 chars. This
@@ -86,7 +86,7 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, a := range req.Argv {
 		if len(a) > execMaxArgLen {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "argv item exceeds 500 chars"})
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "argv item exceeds 16 KB"})
 			return
 		}
 	}
