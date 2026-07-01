@@ -693,6 +693,246 @@ func (s *Store) TakeTask(ctx context.Context, taskID int, agent string) (Advance
 	return AdvanceResult{Task: updated, FromStatus: from, ToStatus: "IN_PROGRESS"}, nil
 }
 
+// Terminal statuses — cancel is a no-op / error on these because the task is done.
+var cancelTerminalStatuses = map[string]bool{
+	"DONE":       true,
+	"CANCELLED":  true,
+	"SUPERSEDED": true,
+	"WONT-DO":    true,
+	"MERGED":     true,
+}
+
+// CancelTask sets status=CANCELLED + audit + closed_at.
+// Errors with a TRANSITION failure if the task is already terminal.
+func (s *Store) CancelTask(ctx context.Context, taskID int, agent, reason string) (AdvanceResult, error) {
+	task, _, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		return AdvanceResult{}, err
+	}
+	from := strings.ToUpper(strings.TrimSpace(task.Status))
+	if cancelTerminalStatuses[from] {
+		return AdvanceResult{
+			Task: task, FromStatus: from, ToStatus: "CANCELLED",
+			Failures: []AdvanceGateFailure{{
+				Check:  "TRANSITION",
+				Detail: fmt.Sprintf("task is already %s — no-op", from),
+			}},
+		}, nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return AdvanceResult{}, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx,
+		`UPDATE tasks SET status = 'CANCELLED', updated_at = NOW()::text, closed_at = NOW()::text WHERE id = $1`,
+		taskID,
+	); err != nil {
+		return AdvanceResult{}, fmt.Errorf("update: %w", err)
+	}
+	logReason := "cancel"
+	if reason != "" {
+		logReason = "cancel: " + reason
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO audit_trail (task_id, agent, field_changed, old_value, new_value, command, timestamp)
+		 VALUES ($1, $2, 'status', $3, 'CANCELLED', $4, NOW()::text)`,
+		taskID, agent, from, logReason,
+	); err != nil {
+		return AdvanceResult{}, fmt.Errorf("audit: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return AdvanceResult{}, fmt.Errorf("commit: %w", err)
+	}
+	if s.cache != nil {
+		s.cache.Bump()
+	}
+	updated := task
+	updated.Status = "CANCELLED"
+	return AdvanceResult{Task: updated, FromStatus: from, ToStatus: "CANCELLED"}, nil
+}
+
+// updatableTextFields is the whitelist for safe UpdateTask targets. Excludes:
+//  - status (transition gates + auto-actions must run Python-side for now)
+//  - custom_fields (JSON merge semantics; Python has explicit merge logic)
+//  - client_id/project_id (UUID normalize + cross-DB validation)
+//  - JSON list columns (done_when, references, tags, blocked_by) — MVP scope
+//  - review_result (append-only column touched by review-submit path)
+var updatableTextFields = map[string]bool{
+	"title":          true,
+	"why":            true,
+	"mode":           true,
+	"note":           true,
+	"business_value": true,
+	"task_plan":      true,
+	"spec":           true,
+	"owner":          true,
+	"parent_task_id": true, // integer but stored as int col — Python does str->int; handle at SQL level
+}
+
+// UpdateResult mirrors AdvanceResult but returns the updated task and per-field diffs.
+type UpdateResult struct {
+	Task     Task                 `json:"task"`
+	Changes  map[string][2]string `json:"changes"` // field → [old, new]
+	Failures []AdvanceGateFailure `json:"failures,omitempty"`
+}
+
+// UpdateTask applies a whitelist of safe text-field updates atomically with audit
+// rows per changed field. Complex updates (status transitions, custom_fields
+// JSON merge, JSON list columns) intentionally remain on the /exec path.
+func (s *Store) UpdateTask(ctx context.Context, taskID int, agent string, updates map[string]string) (UpdateResult, error) {
+	task, _, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		return UpdateResult{}, err
+	}
+	if len(updates) == 0 {
+		return UpdateResult{Task: task, Changes: map[string][2]string{}}, nil
+	}
+	// Reject unknown / non-whitelisted fields all at once so the client sees the full list.
+	var rejected []string
+	for k := range updates {
+		if !updatableTextFields[k] {
+			rejected = append(rejected, k)
+		}
+	}
+	if len(rejected) > 0 {
+		return UpdateResult{
+			Task: task,
+			Failures: []AdvanceGateFailure{{
+				Check:  "FIELDS",
+				Detail: fmt.Sprintf("fields not supported by native update: %s. Use /exec fallback (backlogist #%d update %s:…) or extend server whitelist.", strings.Join(rejected, ", "), taskID, rejected[0]),
+			}},
+		}, nil
+	}
+	// Diff first — skip DB round trip if all no-ops
+	changes := map[string][2]string{}
+	oldByField := map[string]string{}
+	for field, newV := range updates {
+		oldV := currentTextField(task, field)
+		oldByField[field] = oldV
+		if oldV != newV {
+			changes[field] = [2]string{oldV, newV}
+		}
+	}
+	if len(changes) == 0 {
+		return UpdateResult{Task: task, Changes: changes}, nil
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return UpdateResult{}, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Build one UPDATE with all changed fields. Order args stably (sorted keys)
+	// so the parameterisation is deterministic (easier to log/debug).
+	fields := make([]string, 0, len(changes))
+	for f := range changes {
+		fields = append(fields, f)
+	}
+	sort.Strings(fields)
+
+	setClauses := []string{}
+	args := []any{}
+	for i, f := range fields {
+		val := changes[f][1]
+		if f == "parent_task_id" {
+			// Store as INTEGER (NULL when empty). Skip zero-length to allow clearing.
+			if val == "" {
+				setClauses = append(setClauses, fmt.Sprintf("parent_task_id = NULL"))
+				continue
+			}
+			args = append(args, val)
+			setClauses = append(setClauses, fmt.Sprintf("parent_task_id = $%d::integer", len(args)))
+			_ = i
+			continue
+		}
+		args = append(args, val)
+		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", f, len(args)))
+	}
+	setClauses = append(setClauses, "updated_at = NOW()::text")
+	args = append(args, taskID)
+	q := fmt.Sprintf("UPDATE tasks SET %s WHERE id = $%d", strings.Join(setClauses, ", "), len(args))
+	if _, err := tx.Exec(ctx, q, args...); err != nil {
+		return UpdateResult{}, fmt.Errorf("update: %w", err)
+	}
+	for _, f := range fields {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO audit_trail (task_id, agent, field_changed, old_value, new_value, command, timestamp)
+			 VALUES ($1, $2, $3, $4, $5, 'update', NOW()::text)`,
+			taskID, agent, f, changes[f][0], changes[f][1],
+		); err != nil {
+			return UpdateResult{}, fmt.Errorf("audit %s: %w", f, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return UpdateResult{}, fmt.Errorf("commit: %w", err)
+	}
+	if s.cache != nil {
+		s.cache.Bump()
+	}
+	// Refresh task from DB to reflect all changes cleanly (including auto columns).
+	updated, _, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		// Non-fatal: return the stale-ish task with mutations applied in-memory.
+		updated = task
+		for f, diff := range changes {
+			applyTextField(&updated, f, diff[1])
+		}
+	}
+	return UpdateResult{Task: updated, Changes: changes}, nil
+}
+
+// currentTextField returns the current value of a whitelisted text field.
+func currentTextField(t Task, field string) string {
+	switch field {
+	case "title":
+		return t.Title
+	case "why":
+		return t.Why
+	case "mode":
+		return t.Mode
+	case "note":
+		return t.Note
+	case "business_value":
+		return t.BusinessValue
+	case "task_plan":
+		return t.TaskPlan
+	case "spec":
+		return t.Spec
+	case "owner":
+		return t.Owner
+	case "parent_task_id":
+		if t.ParentTaskID == nil {
+			return ""
+		}
+		return fmt.Sprintf("%d", *t.ParentTaskID)
+	}
+	return ""
+}
+
+// applyTextField mutates the Task in-memory (fallback when re-fetching failed).
+func applyTextField(t *Task, field, v string) {
+	switch field {
+	case "title":
+		t.Title = v
+	case "why":
+		t.Why = v
+	case "mode":
+		t.Mode = v
+	case "note":
+		t.Note = v
+	case "business_value":
+		t.BusinessValue = v
+	case "task_plan":
+		t.TaskPlan = v
+	case "spec":
+		t.Spec = v
+	case "owner":
+		t.Owner = v
+	}
+}
+
 // releaseableStatuses — from IN_PROGRESS or REOPENED back to READY (or PLANNING
 // if that's what the operator wants; MVP: always to READY).
 var releaseableStatuses = map[string]bool{

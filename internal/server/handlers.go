@@ -142,6 +142,90 @@ func (s *Server) handleAdvance(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+// handleCancel — POST /task/{id}/cancel. Body: {agent, reason?}. Idempotent
+// on already-terminal statuses (returns 422 TRANSITION).
+func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id must be integer"})
+		return
+	}
+	var req struct {
+		Agent  string `json:"agent"`
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+		return
+	}
+	req.Agent = strings.TrimSpace(req.Agent)
+	if req.Agent == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "agent required"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	res, err := s.store.CancelTask(ctx, id, req.Agent, req.Reason)
+	if err != nil {
+		if store.IsNotFound(err) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "task not found", "id": id})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if len(res.Failures) > 0 {
+		writeJSON(w, http.StatusUnprocessableEntity, res)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// handleUpdate — PATCH /task/{id}. Body: {agent, updates: {field: value}}.
+// Supports only whitelisted text fields (see store.updatableTextFields).
+// Complex updates (status transitions, custom_fields merge, JSON list columns)
+// still route through /exec.
+func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id must be integer"})
+		return
+	}
+	var req struct {
+		Agent   string            `json:"agent"`
+		Updates map[string]string `json:"updates"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+		return
+	}
+	req.Agent = strings.TrimSpace(req.Agent)
+	if req.Agent == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "agent required"})
+		return
+	}
+	if len(req.Updates) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "updates map required"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	res, err := s.store.UpdateTask(ctx, id, req.Agent, req.Updates)
+	if err != nil {
+		if store.IsNotFound(err) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "task not found", "id": id})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if len(res.Failures) > 0 {
+		writeJSON(w, http.StatusUnprocessableEntity, res)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
 // handleTake — POST /task/{id}/take. Sets status=IN_PROGRESS + owner=agent.
 // Does not populate custom_fields.required_agents/reviews (MVP: TASKOWNERS
 // registry still lives in Python; advance/IN_REVIEW gate uses the /exec path).

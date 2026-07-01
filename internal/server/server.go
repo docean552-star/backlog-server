@@ -36,6 +36,8 @@ func New(cfg config.Config, st *store.Store) *Server {
 	r.Post("/task/{id}/advance", s.handleAdvance)
 	r.Post("/task/{id}/take", s.handleTake)
 	r.Post("/task/{id}/release", s.handleRelease)
+	r.Post("/task/{id}/cancel", s.handleCancel)
+	r.Patch("/task/{id}", s.handleUpdate)
 	r.Post("/exec", s.handleExec)
 
 	s.http = &http.Server{
