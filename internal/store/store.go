@@ -863,6 +863,125 @@ func (s *Store) SupersedeTask(ctx context.Context, taskID int, agent string, byI
 	return SupersedeResult{Task: updated, FromStatus: from, ToStatus: "SUPERSEDED", ByID: byID}, nil
 }
 
+// reviewVerdictSet is the CLI-allowed verdict set (parity with
+// cmd_review_submit in ax/backlogist/core/review_submit.py:50).
+//
+// NOTE ON SEMANTIC DRIFT: review_results.verdict has a schema CHECK constraint
+// of {PASS, FAIL, NEEDS_WORK} (schema_postgres.sql:201). ACCEPT will fail the
+// CHECK on INSERT and surface as a 500. REOPEN is remapped to NEEDS_WORK for
+// the review_results row but preserved verbatim in audit_trail.new_value so
+// downstream readers (sync_aggregate_state trigger, closure-reviewer) can
+// disambiguate. Both behaviours mirror the pre-existing Python code exactly.
+var reviewVerdictSet = map[string]bool{
+	"PASS":       true,
+	"ACCEPT":     true, // CLI-allowed; will hit schema CHECK on INSERT (Python parity)
+	"NEEDS_WORK": true,
+	"FAIL":       true,
+	"REOPEN":     true, // stored as NEEDS_WORK in review_results.verdict, kept as REOPEN in audit_trail
+}
+
+// IsValidReviewVerdict reports whether v is one of the CLI-allowed verdicts.
+// Exported so the handler can 400 before the transaction opens.
+func IsValidReviewVerdict(v string) bool { return reviewVerdictSet[strings.ToUpper(strings.TrimSpace(v))] }
+
+// ReviewSubmitResult is what SubmitReview returns to the handler.
+type ReviewSubmitResult struct {
+	TaskID      int    `json:"task_id"`
+	Caller      string `json:"caller"`   // AX_AGENT env / audit_trail.agent (who submitted)
+	Reviewer    string `json:"reviewer"` // review_results.reviewer_model (whose verdict)
+	Verdict     string `json:"verdict"`  // CLI-level verdict (may be REOPEN even when review_results row stores NEEDS_WORK)
+	IsAggregate bool   `json:"is_aggregate"`
+	ReviewID    int64  `json:"review_id"`
+	Summary     string `json:"summary"`
+}
+
+// SubmitReview atomically records a reviewer verdict for taskID:
+//   1. Marks all prior (task_id, reviewer_model) rows in review_results as
+//      is_latest=FALSE.
+//   2. INSERTs a new review_results row with is_latest=TRUE (schema default,
+//      set by the migration in ax/backlogist/storage/db.py:_run_is_latest_migration).
+//   3. INSERTs an audit_trail row. field_changed='review' for a regular
+//      reviewer submit, 'aggregate_review_verdict' when isAggregate — the
+//      latter drives the sync_aggregate_state PG trigger (see #981).
+//
+// Callers: `caller` is the CLI operator (audit.agent), `reviewer` is the
+// reviewer model whose verdict this is (review_results.reviewer_model). These
+// are almost always different values (e.g. caller=samvel, reviewer=code-reviewer).
+//
+// Not ported from Python cmd_review_submit:
+//   - _check_review_patterns (3 situational advisories — rate, self-review,
+//     batch closure). They read cross-table state; cost/complexity high, MVP
+//     leaves them client-side.
+//   - Next-steps hints (still-needed reviews, «→ update status:IN_REVIEW»).
+//     Uses transition_gates._get_required_reviews which isn't in Go yet.
+func (s *Store) SubmitReview(ctx context.Context, taskID int, caller, reviewer, verdict, summary string, isAggregate bool) (ReviewSubmitResult, error) {
+	if _, _, err := s.GetTask(ctx, taskID); err != nil {
+		return ReviewSubmitResult{}, err
+	}
+	verdict = strings.ToUpper(strings.TrimSpace(verdict))
+	if summary == "" {
+		summary = fmt.Sprintf("%s review: %s", reviewer, verdict)
+	}
+	dbVerdict := verdict
+	if verdict == "REOPEN" {
+		dbVerdict = "NEEDS_WORK"
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return ReviewSubmitResult{}, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE review_results SET is_latest = FALSE WHERE task_id = $1 AND reviewer_model = $2`,
+		taskID, reviewer,
+	); err != nil {
+		return ReviewSubmitResult{}, fmt.Errorf("mark prior not-latest: %w", err)
+	}
+
+	var reviewID int64
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO review_results
+		     (task_id, verdict, summary, coverage_score, reviewed_at, reviewer_model, cost_usd)
+		 VALUES ($1, $2, $3, 0, NOW()::text, $4, 0)
+		 RETURNING id`,
+		taskID, dbVerdict, summary, reviewer,
+	).Scan(&reviewID); err != nil {
+		return ReviewSubmitResult{}, fmt.Errorf("insert review: %w", err)
+	}
+
+	auditField := "review"
+	auditNew := fmt.Sprintf("%s:%s", reviewer, verdict)
+	if isAggregate {
+		auditField = "aggregate_review_verdict"
+		auditNew = verdict
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO audit_trail (task_id, agent, field_changed, old_value, new_value, command, timestamp)
+		 VALUES ($1, $2, $3, '', $4, 'review-submit', NOW()::text)`,
+		taskID, caller, auditField, auditNew,
+	); err != nil {
+		return ReviewSubmitResult{}, fmt.Errorf("audit: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return ReviewSubmitResult{}, fmt.Errorf("commit: %w", err)
+	}
+	if s.cache != nil {
+		s.cache.Bump()
+	}
+	return ReviewSubmitResult{
+		TaskID:      taskID,
+		Caller:      caller,
+		Reviewer:    reviewer,
+		Verdict:     verdict,
+		IsAggregate: isAggregate,
+		ReviewID:    reviewID,
+		Summary:     summary,
+	}, nil
+}
+
 // updatableTextFields is the whitelist for safe UpdateTask targets. Excludes:
 //  - status (transition gates + auto-actions must run Python-side for now)
 //  - custom_fields (JSON merge semantics; Python has explicit merge logic)

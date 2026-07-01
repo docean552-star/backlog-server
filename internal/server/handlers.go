@@ -226,6 +226,69 @@ func (s *Server) handleSupersede(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+// handleReviewSubmit — POST /task/{id}/review-submit. Body:
+// {agent, reviewer, verdict, summary?, is_aggregate?}.
+//
+//   - agent = the CLI operator (audit_trail.agent). Matches the other
+//     endpoints' body convention.
+//   - reviewer = the reviewer model whose verdict this records
+//     (review_results.reviewer_model). Comes from the CLI's --agent flag.
+//   - verdict ∈ {PASS, ACCEPT, NEEDS_WORK, FAIL, REOPEN}. ACCEPT will hit
+//     the schema CHECK on review_results.verdict and 500 — this is pre-existing
+//     Python behaviour that we mirror. REOPEN is remapped to NEEDS_WORK for
+//     the row, kept verbatim in audit_trail.
+//   - summary optional (default "{reviewer} review: {verdict}").
+//   - is_aggregate optional (drives audit field switch for #981 aggregate flow).
+func (s *Server) handleReviewSubmit(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id must be integer"})
+		return
+	}
+	var req struct {
+		Agent       string `json:"agent"`
+		Reviewer    string `json:"reviewer"`
+		Verdict     string `json:"verdict"`
+		Summary     string `json:"summary"`
+		IsAggregate bool   `json:"is_aggregate"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+		return
+	}
+	req.Agent = strings.TrimSpace(req.Agent)
+	req.Reviewer = strings.TrimSpace(req.Reviewer)
+	req.Verdict = strings.TrimSpace(req.Verdict)
+	if req.Agent == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "agent required (caller / audit_trail.agent)"})
+		return
+	}
+	if req.Reviewer == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "reviewer required (reviewer_model — e.g. code-reviewer)"})
+		return
+	}
+	if req.Verdict == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "verdict required (PASS/ACCEPT/NEEDS_WORK/FAIL/REOPEN)"})
+		return
+	}
+	if !store.IsValidReviewVerdict(req.Verdict) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid verdict '" + req.Verdict + "' — use PASS/ACCEPT/NEEDS_WORK/FAIL/REOPEN"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	res, err := s.store.SubmitReview(ctx, id, req.Agent, req.Reviewer, req.Verdict, req.Summary, req.IsAggregate)
+	if err != nil {
+		if store.IsNotFound(err) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "task not found", "id": id})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
 // handleUpdate — PATCH /task/{id}. Body: {agent, updates: {field: value}}.
 // Supports only whitelisted text fields (see store.updatableTextFields).
 // Complex updates (status transitions, custom_fields merge, JSON list columns)

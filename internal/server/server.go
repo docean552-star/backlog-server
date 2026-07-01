@@ -38,6 +38,7 @@ func New(cfg config.Config, st *store.Store) *Server {
 	r.Post("/task/{id}/release", s.handleRelease)
 	r.Post("/task/{id}/cancel", s.handleCancel)
 	r.Post("/task/{id}/supersede", s.handleSupersede)
+	r.Post("/task/{id}/review-submit", s.handleReviewSubmit)
 	r.Patch("/task/{id}", s.handleUpdate)
 	r.Post("/exec", s.handleExec)
 
