@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -102,6 +103,32 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), execTimeout)
 	defer cancel()
+
+	// Best-effort git pull before every backlogist subprocess. This is the fix
+	// for the "frozen /opt/apps/ax" bug: without it, the tree only reflected
+	// the tar-based bootstrap snapshot; a client's just-pushed docs/specs/*
+	// were invisible to gate checks that Python reads off disk.
+	//
+	// Notes:
+	//  - 5s timeout keeps a slow origin from starving the request.
+	//  - --autostash lets us survive any transient local edits (someone
+	//    running scripts on the box directly). --rebase over origin/main
+	//    means the tree matches origin exactly on success.
+	//  - Errors are logged, NOT returned: the subprocess still runs against
+	//    whatever is currently on disk (which is still fresher than not
+	//    pulling). Failure modes: network to GitHub down, or the tree drifted.
+	//  - Skip for `pager` — that path never touches spec files.
+	if module == "backlogist" {
+		pullCtx, cancelPull := context.WithTimeout(ctx, 5*time.Second)
+		pull := exec.CommandContext(pullCtx, "git", "-C", execWorkDir,
+			"pull", "--rebase", "--autostash", "origin", "main")
+		pull.Env = os.Environ()
+		if out, err := pull.CombinedOutput(); err != nil {
+			log.Printf("git pull /opt/apps/ax failed (continuing): %s: %v",
+				bytes.TrimSpace(out), err)
+		}
+		cancelPull()
+	}
 
 	// Build argv: python -m <module> <user argv...>
 	pyArgs := append([]string{"-m", module}, req.Argv...)
