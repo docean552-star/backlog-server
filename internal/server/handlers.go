@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -95,6 +96,49 @@ func (s *Server) handleNext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	setCache(w, hit)
+	writeJSON(w, http.StatusOK, res)
+}
+
+// handleAdvance is the first native write endpoint (POST /task/{id}/advance).
+// It runs the server-side DB gates (done_when non-empty + latest spec-reviewer
+// PASS for PLANNING → READY) and UPDATE + audit-trail atomically. File-based
+// gates (research.md content, task_plan KQ/TS count) are the client's job —
+// the server never touches specs on disk. See store.AdvanceTask godoc.
+func (s *Server) handleAdvance(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id must be integer"})
+		return
+	}
+	var req struct {
+		Agent string `json:"agent"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+		return
+	}
+	req.Agent = strings.TrimSpace(req.Agent)
+	if req.Agent == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "agent required"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	res, err := s.store.AdvanceTask(ctx, id, req.Agent)
+	if err != nil {
+		if store.IsNotFound(err) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "task not found", "id": id})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if len(res.Failures) > 0 {
+		// 422 Unprocessable Entity — semantics fit: request was well-formed,
+		// but server-side rules blocked the state change.
+		writeJSON(w, http.StatusUnprocessableEntity, res)
+		return
+	}
 	writeJSON(w, http.StatusOK, res)
 }
 

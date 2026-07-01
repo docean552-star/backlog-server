@@ -459,3 +459,158 @@ func round1(x float64) float64 {
 	// One decimal place, matching Python `round(x, 1)`.
 	return float64(int64(x*10+0.5)) / 10
 }
+
+// ---------------------------------------------------------------------------
+// Advance — status transition with server-side DB gate checks
+// ---------------------------------------------------------------------------
+
+// AdvanceGateFailure is one item returned when a DB gate check blocks advance.
+// File-based gate checks (research.md content, task_plan KQ/TS count, agent
+// markers) stay on the client — the server has no local FS access to specs.
+type AdvanceGateFailure struct {
+	Check  string `json:"check"`
+	Detail string `json:"detail"`
+}
+
+// codeTaskAdvanceMap is the linear code_task lifecycle: BACKLOG → PLANNING →
+// READY → IN_PROGRESS → IN_REVIEW → AWAITING_APPROVAL → DONE.
+var codeTaskAdvanceMap = map[string]string{
+	"BACKLOG":           "PLANNING",
+	"PLANNING":          "READY",
+	"READY":             "IN_PROGRESS",
+	"IN_PROGRESS":       "IN_REVIEW",
+	"IN_REVIEW":         "AWAITING_APPROVAL",
+	"AWAITING_APPROVAL": "DONE",
+}
+
+// ComputeAdvanceTarget returns the next status for a code_task advance, or ""
+// if no advance is defined. Non-code workflows (think_task, marketing, seo, …)
+// aren't handled server-side yet — they still go through the /exec subprocess
+// proxy. MVP covers code_task only; the other workflows land in follow-ups.
+func ComputeAdvanceTarget(currentStatus, workflow string) string {
+	wf := strings.ToLower(strings.TrimSpace(workflow))
+	if wf != "" && wf != "code_task" {
+		return ""
+	}
+	return codeTaskAdvanceMap[strings.ToUpper(currentStatus)]
+}
+
+// HasLatestVerdict returns true iff a review_results row exists for this task
+// with the given reviewer_model + verdict AND is_latest=true (matches the
+// Python helper in backlogist/core/transition_gates.py::_has_review_verdict).
+func (s *Store) HasLatestVerdict(ctx context.Context, taskID int, reviewer, verdict string) (bool, error) {
+	var ok bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS(
+			SELECT 1 FROM review_results
+			 WHERE task_id = $1
+			   AND reviewer_model = $2
+			   AND verdict = $3
+			   AND is_latest = true
+		)`,
+		taskID, reviewer, verdict,
+	).Scan(&ok)
+	return ok, err
+}
+
+// AdvanceResult is the payload the /advance handler returns to the client.
+type AdvanceResult struct {
+	Task       Task                 `json:"task"`
+	FromStatus string               `json:"from_status"`
+	ToStatus   string               `json:"to_status"`
+	Failures   []AdvanceGateFailure `json:"failures,omitempty"`
+}
+
+// AdvanceTask runs DB-side gate checks and, on pass, UPDATE status +
+// INSERT audit_trail atomically. Returns:
+//   - result populated with task + failures if any gate failed (no update happened)
+//   - pgx.ErrNoRows if the task doesn't exist
+//   - any other error from the DB
+//
+// The scope of gate checks in MVP is intentionally narrow (code_task only,
+// PLANNING → READY only): done_when non-empty + spec-reviewer PASS. File-based
+// checks (research.md content quality, task_plan KQ/TS count, agent markers)
+// remain a client-side concern — client should refuse to POST /advance if its
+// own local check finds those missing.
+func (s *Store) AdvanceTask(ctx context.Context, taskID int, agent string) (AdvanceResult, error) {
+	task, _, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		return AdvanceResult{}, err
+	}
+	fromStatus := strings.ToUpper(strings.TrimSpace(task.Status))
+
+	to := ComputeAdvanceTarget(fromStatus, task.Workflow)
+	if to == "" {
+		return AdvanceResult{
+			Task:       task,
+			FromStatus: fromStatus,
+			ToStatus:   "",
+			Failures: []AdvanceGateFailure{{
+				Check:  "WORKFLOW",
+				Detail: fmt.Sprintf("no server-side advance defined for status=%s workflow=%q (MVP covers code_task only)", fromStatus, task.Workflow),
+			}},
+		}, nil
+	}
+
+	// Server-side DB gates. MVP covers PLANNING → READY. Other transitions
+	// pass through with no server-side check (client-side gates still enforce).
+	var failures []AdvanceGateFailure
+	if fromStatus == "PLANNING" && to == "READY" {
+		if len(task.DoneWhen) == 0 {
+			failures = append(failures, AdvanceGateFailure{
+				Check:  "DONE_WHEN",
+				Detail: fmt.Sprintf("done_when is empty. Run: backlogist #%d update done_when:\"operator sees X, tests pass, …\"", taskID),
+			})
+		}
+		hasPass, err := s.HasLatestVerdict(ctx, taskID, "spec-reviewer", "PASS")
+		if err != nil {
+			return AdvanceResult{}, fmt.Errorf("verdict lookup: %w", err)
+		}
+		if !hasPass {
+			failures = append(failures, AdvanceGateFailure{
+				Check:  "SPEC_REVIEW",
+				Detail: fmt.Sprintf("no latest spec-reviewer PASS verdict. Run @spec-reviewer, then: backlogist review-submit #%d --agent spec-reviewer --verdict PASS", taskID),
+			})
+		}
+	}
+	if len(failures) > 0 {
+		return AdvanceResult{Task: task, FromStatus: fromStatus, ToStatus: to, Failures: failures}, nil
+	}
+
+	// Passed. UPDATE tasks + INSERT audit_trail atomically.
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return AdvanceResult{}, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx) // no-op after commit
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE tasks SET status = $1, updated_at = NOW()::text WHERE id = $2`,
+		to, taskID,
+	); err != nil {
+		return AdvanceResult{}, fmt.Errorf("update tasks: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO audit_trail (task_id, agent, field_changed, old_value, new_value, command, timestamp)
+		 VALUES ($1, $2, 'status', $3, $4, 'advance', NOW()::text)`,
+		taskID, agent, fromStatus, to,
+	); err != nil {
+		return AdvanceResult{}, fmt.Errorf("insert audit: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return AdvanceResult{}, fmt.Errorf("commit: %w", err)
+	}
+
+	// Invalidate reads (task cache + status counts + tasks lists + next).
+	// Simple + safe: bump the version prefix, all previous keys become
+	// unreachable and age out via TTL. Also handled by the LISTEN/NOTIFY
+	// subscriber, but do it explicitly here so the response the client sees
+	// immediately after advance is a fresh read.
+	if s.cache != nil {
+		s.cache.Bump()
+	}
+
+	updated := task
+	updated.Status = to
+	return AdvanceResult{Task: updated, FromStatus: fromStatus, ToStatus: to}, nil
+}
