@@ -614,3 +614,135 @@ func (s *Store) AdvanceTask(ctx context.Context, taskID int, agent string) (Adva
 	updated.Status = to
 	return AdvanceResult{Task: updated, FromStatus: fromStatus, ToStatus: to}, nil
 }
+
+// ---------------------------------------------------------------------------
+// Take / Release — status + owner updates with audit
+// ---------------------------------------------------------------------------
+
+// TakeResult / ReleaseResult reuse AdvanceResult shape for consistency.
+
+// Statuses from which `take` can move a task to IN_PROGRESS. Mirrors the
+// validate_transition() rules for code_task in backlogist/core/workflows.py.
+// Non-code workflows may allow different sources; MVP applies the same set
+// broadly — advance-gate errors will surface any real conflicts.
+var takeableStatuses = map[string]bool{
+	"BACKLOG":     true,
+	"PLANNING":    true,
+	"READY":       true,
+	"REOPENED":    true,
+	"IN_PROGRESS": true, // idempotent: taking your own IN_PROGRESS task = no-op
+	"TODO":        true,
+}
+
+// TakeTask sets status=IN_PROGRESS + owner=agent + audit. Does NOT populate
+// custom_fields.required_agents/reviews (Python's cmd_take does — needs
+// TASKOWNERS registry ported to Go). Does NOT start a time_entry or emit bot
+// events. Those niceties stay on the /exec path until we port them.
+func (s *Store) TakeTask(ctx context.Context, taskID int, agent string) (AdvanceResult, error) {
+	task, _, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		return AdvanceResult{}, err
+	}
+	from := strings.ToUpper(strings.TrimSpace(task.Status))
+	if !takeableStatuses[from] {
+		return AdvanceResult{
+			Task: task, FromStatus: from, ToStatus: "IN_PROGRESS",
+			Failures: []AdvanceGateFailure{{
+				Check:  "TRANSITION",
+				Detail: fmt.Sprintf("cannot take task in status %s (must be one of BACKLOG/PLANNING/READY/REOPENED/TODO)", from),
+			}},
+		}, nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return AdvanceResult{}, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	oldOwner := task.Owner
+	if _, err := tx.Exec(ctx,
+		`UPDATE tasks SET status = 'IN_PROGRESS', owner = $1, updated_at = NOW()::text WHERE id = $2`,
+		agent, taskID,
+	); err != nil {
+		return AdvanceResult{}, fmt.Errorf("update: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO audit_trail (task_id, agent, field_changed, old_value, new_value, command, timestamp)
+		 VALUES ($1, $2, 'status', $3, 'IN_PROGRESS', 'take', NOW()::text)`,
+		taskID, agent, from,
+	); err != nil {
+		return AdvanceResult{}, fmt.Errorf("audit status: %w", err)
+	}
+	if oldOwner != agent {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO audit_trail (task_id, agent, field_changed, old_value, new_value, command, timestamp)
+			 VALUES ($1, $2, 'owner', $3, $4, 'take', NOW()::text)`,
+			taskID, agent, oldOwner, agent,
+		); err != nil {
+			return AdvanceResult{}, fmt.Errorf("audit owner: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return AdvanceResult{}, fmt.Errorf("commit: %w", err)
+	}
+	if s.cache != nil {
+		s.cache.Bump()
+	}
+	updated := task
+	updated.Status = "IN_PROGRESS"
+	updated.Owner = agent
+	return AdvanceResult{Task: updated, FromStatus: from, ToStatus: "IN_PROGRESS"}, nil
+}
+
+// releaseableStatuses — from IN_PROGRESS or REOPENED back to READY (or PLANNING
+// if that's what the operator wants; MVP: always to READY).
+var releaseableStatuses = map[string]bool{
+	"IN_PROGRESS": true,
+	"REOPENED":    true,
+}
+
+// ReleaseTask sets status=READY + audit. Doesn't clear owner (keeps ownership
+// so history is preserved; the Python cmd_release also leaves owner alone).
+// No time-entry close: side effect deferred to a future commit.
+func (s *Store) ReleaseTask(ctx context.Context, taskID int, agent string) (AdvanceResult, error) {
+	task, _, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		return AdvanceResult{}, err
+	}
+	from := strings.ToUpper(strings.TrimSpace(task.Status))
+	if !releaseableStatuses[from] {
+		return AdvanceResult{
+			Task: task, FromStatus: from, ToStatus: "READY",
+			Failures: []AdvanceGateFailure{{
+				Check:  "TRANSITION",
+				Detail: fmt.Sprintf("cannot release task in status %s (only IN_PROGRESS/REOPENED)", from),
+			}},
+		}, nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return AdvanceResult{}, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx,
+		`UPDATE tasks SET status = 'READY', updated_at = NOW()::text WHERE id = $1`,
+		taskID,
+	); err != nil {
+		return AdvanceResult{}, fmt.Errorf("update: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO audit_trail (task_id, agent, field_changed, old_value, new_value, command, timestamp)
+		 VALUES ($1, $2, 'status', $3, 'READY', 'release', NOW()::text)`,
+		taskID, agent, from,
+	); err != nil {
+		return AdvanceResult{}, fmt.Errorf("audit: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return AdvanceResult{}, fmt.Errorf("commit: %w", err)
+	}
+	if s.cache != nil {
+		s.cache.Bump()
+	}
+	updated := task
+	updated.Status = "READY"
+	return AdvanceResult{Task: updated, FromStatus: from, ToStatus: "READY"}, nil
+}

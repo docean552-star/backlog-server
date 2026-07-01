@@ -34,6 +34,8 @@ func New(cfg config.Config, st *store.Store) *Server {
 	r.Get("/next/{agent}", s.handleNext)
 	r.Get("/status", s.handleStatus)
 	r.Post("/task/{id}/advance", s.handleAdvance)
+	r.Post("/task/{id}/take", s.handleTake)
+	r.Post("/task/{id}/release", s.handleRelease)
 	r.Post("/exec", s.handleExec)
 
 	s.http = &http.Server{
