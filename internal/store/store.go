@@ -610,8 +610,15 @@ func (s *Store) AdvanceTask(ctx context.Context, taskID int, agent string) (Adva
 		s.cache.Bump()
 	}
 
-	updated := task
-	updated.Status = to
+	// Refetch so updated_at / closed_at / any DB-side trigger effects appear in
+	// the response. Fallback to in-memory mutation if the refetch fails (edge
+	// case: DB unreachable right after commit) — status is the truth we
+	// committed even if the read fails.
+	updated, _, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		updated = task
+		updated.Status = to
+	}
 	return AdvanceResult{Task: updated, FromStatus: fromStatus, ToStatus: to}, nil
 }
 
@@ -687,9 +694,12 @@ func (s *Store) TakeTask(ctx context.Context, taskID int, agent string) (Advance
 	if s.cache != nil {
 		s.cache.Bump()
 	}
-	updated := task
-	updated.Status = "IN_PROGRESS"
-	updated.Owner = agent
+	updated, _, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		updated = task
+		updated.Status = "IN_PROGRESS"
+		updated.Owner = agent
+	}
 	return AdvanceResult{Task: updated, FromStatus: from, ToStatus: "IN_PROGRESS"}, nil
 }
 
@@ -747,8 +757,11 @@ func (s *Store) CancelTask(ctx context.Context, taskID int, agent, reason string
 	if s.cache != nil {
 		s.cache.Bump()
 	}
-	updated := task
-	updated.Status = "CANCELLED"
+	updated, _, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		updated = task
+		updated.Status = "CANCELLED"
+	}
 	return AdvanceResult{Task: updated, FromStatus: from, ToStatus: "CANCELLED"}, nil
 }
 
@@ -841,9 +854,12 @@ func (s *Store) SupersedeTask(ctx context.Context, taskID int, agent string, byI
 	if s.cache != nil {
 		s.cache.Bump()
 	}
-	updated := task
-	updated.Status = "SUPERSEDED"
-	updated.Note = newNote
+	updated, _, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		updated = task
+		updated.Status = "SUPERSEDED"
+		updated.Note = newNote
+	}
 	return SupersedeResult{Task: updated, FromStatus: from, ToStatus: "SUPERSEDED", ByID: byID}, nil
 }
 
@@ -1077,7 +1093,10 @@ func (s *Store) ReleaseTask(ctx context.Context, taskID int, agent string) (Adva
 	if s.cache != nil {
 		s.cache.Bump()
 	}
-	updated := task
-	updated.Status = "READY"
+	updated, _, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		updated = task
+		updated.Status = "READY"
+	}
 	return AdvanceResult{Task: updated, FromStatus: from, ToStatus: "READY"}, nil
 }
