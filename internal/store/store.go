@@ -752,6 +752,101 @@ func (s *Store) CancelTask(ctx context.Context, taskID int, agent, reason string
 	return AdvanceResult{Task: updated, FromStatus: from, ToStatus: "CANCELLED"}, nil
 }
 
+// supersedeTerminalStatuses: statuses from which supersede is refused. Mirrors
+// _TERMINAL_STATUSES in backlogist/core/commands.py:1721 — importantly DIFFERS
+// from cancelTerminalStatuses in that DONE is NOT terminal here (Python allows
+// DONE → SUPERSEDED; see test_cancel_supersede.py::test_b2).
+var supersedeTerminalStatuses = map[string]bool{
+	"CANCELLED":  true,
+	"SUPERSEDED": true,
+	"WONT-DO":    true,
+	"MERGED":     true,
+}
+
+// SupersedeResult carries the same shape as AdvanceResult plus the replacement id.
+type SupersedeResult struct {
+	Task       Task                 `json:"task"`
+	FromStatus string               `json:"from_status"`
+	ToStatus   string               `json:"to_status"`
+	ByID       int                  `json:"by_id"`
+	Failures   []AdvanceGateFailure `json:"failures,omitempty"`
+}
+
+// SupersedeTask marks taskID as SUPERSEDED by byID: UPDATE tasks
+// (status='SUPERSEDED', note="Superseded by #{byID}", closed_at=NOW()) +
+// INSERT audit_trail (command="supersede --by #{byID}") atomically.
+//
+// Semantics ported from backlogist/core/commands.py::cmd_supersede:
+//   - byID must reference an existing task (422 REPLACEMENT if missing).
+//   - DONE is a valid source status (unlike cancel).
+//   - note is rewritten to "Superseded by #{byID}" verbatim.
+//
+// Not ported: _warn_blocked_dependents (stderr hint about dependents whose
+// blocked_by still references this task). Callers can enumerate them with
+// `backlogist search blocked_by:#{id}` after the fact.
+//
+// export_yaml() is also not called — the Python CLI regenerates local
+// backlog.yaml on write; native callers work through HTTP and don't need it.
+func (s *Store) SupersedeTask(ctx context.Context, taskID int, agent string, byID int) (SupersedeResult, error) {
+	task, _, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		return SupersedeResult{}, err
+	}
+	from := strings.ToUpper(strings.TrimSpace(task.Status))
+	if supersedeTerminalStatuses[from] {
+		return SupersedeResult{
+			Task: task, FromStatus: from, ToStatus: "SUPERSEDED", ByID: byID,
+			Failures: []AdvanceGateFailure{{
+				Check:  "TRANSITION",
+				Detail: fmt.Sprintf("task is already %s — cannot supersede", from),
+			}},
+		}, nil
+	}
+	// Replacement must exist. 422 REPLACEMENT (not 404) — the target task
+	// itself is fine; it's the --by argument that points nowhere.
+	if _, _, err := s.GetTask(ctx, byID); err != nil {
+		if IsNotFound(err) {
+			return SupersedeResult{
+				Task: task, FromStatus: from, ToStatus: "SUPERSEDED", ByID: byID,
+				Failures: []AdvanceGateFailure{{
+					Check:  "REPLACEMENT",
+					Detail: fmt.Sprintf("replacement task #%d not found", byID),
+				}},
+			}, nil
+		}
+		return SupersedeResult{}, fmt.Errorf("lookup replacement: %w", err)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return SupersedeResult{}, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	newNote := fmt.Sprintf("Superseded by #%d", byID)
+	if _, err := tx.Exec(ctx,
+		`UPDATE tasks SET status = 'SUPERSEDED', note = $1, updated_at = NOW()::text, closed_at = NOW()::text WHERE id = $2`,
+		newNote, taskID,
+	); err != nil {
+		return SupersedeResult{}, fmt.Errorf("update: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO audit_trail (task_id, agent, field_changed, old_value, new_value, command, timestamp)
+		 VALUES ($1, $2, 'status', $3, 'SUPERSEDED', $4, NOW()::text)`,
+		taskID, agent, from, fmt.Sprintf("supersede --by #%d", byID),
+	); err != nil {
+		return SupersedeResult{}, fmt.Errorf("audit: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return SupersedeResult{}, fmt.Errorf("commit: %w", err)
+	}
+	if s.cache != nil {
+		s.cache.Bump()
+	}
+	updated := task
+	updated.Status = "SUPERSEDED"
+	updated.Note = newNote
+	return SupersedeResult{Task: updated, FromStatus: from, ToStatus: "SUPERSEDED", ByID: byID}, nil
+}
+
 // updatableTextFields is the whitelist for safe UpdateTask targets. Excludes:
 //  - status (transition gates + auto-actions must run Python-side for now)
 //  - custom_fields (JSON merge semantics; Python has explicit merge logic)
