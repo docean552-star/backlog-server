@@ -1239,6 +1239,46 @@ func (s *Store) RequestRevision(ctx context.Context, taskID int, agent, reason s
 }
 
 // ---------------------------------------------------------------------------
+// edges — task_edges rows for a task (both directions)
+// ---------------------------------------------------------------------------
+
+// TaskEdge is one row of the task_edges table. Direction fields are omitted:
+// callers know the task they queried and can compute in/out from
+// FromTaskID vs ToTaskID.
+type TaskEdge struct {
+	FromTaskID int    `json:"from_task_id"`
+	ToTaskID   int    `json:"to_task_id"`
+	EdgeType   string `json:"edge_type"`
+}
+
+// TaskEdges returns every task_edges row incident to taskID, in either
+// direction, ordered by (from_task_id, to_task_id) for stable output. Empty
+// slice when there are no edges — no 404 (a task with zero edges is a valid
+// state, and this endpoint is meant to be polled).
+func (s *Store) TaskEdges(ctx context.Context, taskID int) ([]TaskEdge, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT from_task_id, to_task_id, edge_type
+		   FROM task_edges
+		  WHERE from_task_id = $1 OR to_task_id = $1
+		  ORDER BY from_task_id, to_task_id`,
+		taskID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query task_edges: %w", err)
+	}
+	defer rows.Close()
+	out := []TaskEdge{}
+	for rows.Next() {
+		var e TaskEdge
+		if err := rows.Scan(&e.FromTaskID, &e.ToTaskID, &e.EdgeType); err != nil {
+			return nil, fmt.Errorf("scan task_edges: %w", err)
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
 // anomalies — thin subset of Python cmd_anomalies (5 of 6 checks)
 // ---------------------------------------------------------------------------
 

@@ -414,6 +414,25 @@ func (s *Server) handleRevision(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+// handleEdges — GET /task/{id}/edges. Returns task_edges rows in either
+// direction, ordered by (from_task_id, to_task_id). Empty array when the
+// task has no edges — no 404 (this endpoint is meant to be polled).
+func (s *Server) handleEdges(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id must be integer"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	edges, err := s.store.TaskEdges(ctx, id)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, edges)
+}
+
 // handleAnomalies — GET /anomalies. Returns the JSON version of Python
 // cmd_anomalies (five of six anomaly types — missing-context-map stays on
 // /exec because it needs a yaml file the server doesn't ship).
