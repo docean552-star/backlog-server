@@ -414,6 +414,31 @@ func (s *Server) handleRevision(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+// handleHistory — GET /task/{id}/history?limit=N. Returns audit_trail rows
+// for the task, oldest first. Missing task → empty array (no 404), matching
+// audit-feed semantics.
+func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id must be integer"})
+		return
+	}
+	limit := 0
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if n, err := strconv.Atoi(l); err == nil && n > 0 && n <= 5000 {
+			limit = n
+		}
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	rows, err := s.store.TaskHistory(ctx, id, limit)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, rows)
+}
+
 // handleKnowledge — POST /knowledge. Body:
 // {task_id?, context, decision, consequences, source?}. 400 if all of
 // context/decision/consequences are empty (nothing to save).

@@ -1238,6 +1238,61 @@ func (s *Store) RequestRevision(ctx context.Context, taskID int, agent, reason s
 }
 
 // ---------------------------------------------------------------------------
+// history — audit_trail rows for a task
+// ---------------------------------------------------------------------------
+
+// AuditRow is one row of the audit_trail exposed by GET /task/{id}/history.
+type AuditRow struct {
+	ID           int64  `json:"id"`
+	Agent        string `json:"agent"`
+	Timestamp    string `json:"timestamp"`
+	FieldChanged string `json:"field_changed"`
+	OldValue     string `json:"old_value"`
+	NewValue     string `json:"new_value"`
+	Reason       string `json:"reason"`
+	Command      string `json:"command"`
+}
+
+// TaskHistory returns audit_trail rows for taskID, oldest first (parity with
+// Python cmd_history's `ORDER BY timestamp ASC`). Default limit is 50 to
+// match cmd_history's default; pass 0 to disable the LIMIT clause.
+//
+// Read is idempotent — a non-existent task returns an empty slice instead of
+// 404. This matches how audit-trail-style feeds behave (append-only, no
+// consumer needs presence-check).
+func (s *Store) TaskHistory(ctx context.Context, taskID, limit int) ([]AuditRow, error) {
+	if limit < 0 {
+		limit = 0
+	}
+	if limit == 0 {
+		limit = 50 // Python cmd_history default
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, agent, timestamp, field_changed,
+		        COALESCE(old_value, ''), COALESCE(new_value, ''),
+		        COALESCE(reason, ''), COALESCE(command, '')
+		   FROM audit_trail
+		  WHERE task_id = $1
+		  ORDER BY timestamp ASC
+		  LIMIT $2`,
+		taskID, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query audit_trail: %w", err)
+	}
+	defer rows.Close()
+	out := []AuditRow{}
+	for rows.Next() {
+		var r AuditRow
+		if err := rows.Scan(&r.ID, &r.Agent, &r.Timestamp, &r.FieldChanged, &r.OldValue, &r.NewValue, &r.Reason, &r.Command); err != nil {
+			return nil, fmt.Errorf("scan audit_trail: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
 // knowledge — ADR-style entries stored in knowledge_entries
 // ---------------------------------------------------------------------------
 
