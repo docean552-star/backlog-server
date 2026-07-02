@@ -414,6 +414,20 @@ func (s *Server) handleRevision(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+// handleAnomalies — GET /anomalies. Returns the JSON version of Python
+// cmd_anomalies (five of six anomaly types — missing-context-map stays on
+// /exec because it needs a yaml file the server doesn't ship).
+func (s *Server) handleAnomalies(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	res, err := s.store.Anomalies(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
 // handleAnalytics — GET /analytics?agent=&period=Nd. Returns a thin JSON
 // subset of Python cmd_analytics: velocity (DONE per week over the period),
 // per-status counts, and by-agent totals (Done / Active / Blocked buckets).

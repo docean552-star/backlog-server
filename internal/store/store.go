@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -1235,6 +1236,169 @@ func (s *Store) RequestRevision(ctx context.Context, taskID int, agent, reason s
 		updated.Status = "REVISION"
 	}
 	return RevisionResult{Task: updated, FromStatus: from, ToStatus: "REVISION", Reason: reason}, nil
+}
+
+// ---------------------------------------------------------------------------
+// anomalies — thin subset of Python cmd_anomalies (5 of 6 checks)
+// ---------------------------------------------------------------------------
+
+// AnomaliesResult is the JSON shape returned by GET /anomalies. Every list
+// holds human-readable strings identical (line-for-line) to what Python's
+// cmd_anomalies prints, so downstream tooling that greps the /exec output
+// keeps working when it switches to native.
+type AnomaliesResult struct {
+	BareBlocker []string `json:"bare_blocker"`
+	NoTaskPlan  []string `json:"no_taskplan"`
+	Stale       []string `json:"stale"`
+	OrphanDep   []string `json:"orphan_dep"`
+	NoDoneWhen  []string `json:"no_donewhen"`
+}
+
+// closedStatuses mirrors Python's _CLOSED_STATUSES set — tasks in these are
+// skipped by every anomaly check.
+var closedStatuses = map[string]bool{
+	"DONE": true, "CANCELLED": true, "SUPERSEDED": true, "WONT-DO": true, "MERGED": true,
+}
+
+// Anomalies inspects the whole tasks table and returns a bucketed list of
+// human-readable anomaly strings, matching Python cmd_anomalies exactly on
+// five of the six anomaly types. The sixth (missing-context-map) is skipped
+// because it needs a yaml file the server doesn't ship. Callers that want
+// the missing-context-map check must stay on /exec.
+//
+// Costs one SELECT of the whole tasks table (id, status, mode, workflow,
+// task_plan, done_when, blocked_by, created_at). Everything else runs in
+// memory. Fine for the ≈1300-row prod backlog; would need indexing if we
+// hit five figures.
+func (s *Store) Anomalies(ctx context.Context) (AnomaliesResult, error) {
+	res := AnomaliesResult{
+		BareBlocker: []string{},
+		NoTaskPlan:  []string{},
+		Stale:       []string{},
+		OrphanDep:   []string{},
+		NoDoneWhen:  []string{},
+	}
+
+	type row struct {
+		id        int
+		status    string
+		mode      string
+		workflow  string
+		taskPlan  string
+		doneWhen  []int // len only used
+		blockedBy []int
+		createdAt string
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, status, mode, COALESCE(workflow, ''), COALESCE(task_plan, ''),
+		        COALESCE(done_when, '[]'), COALESCE(blocked_by, '[]'),
+		        COALESCE(created_at, '')
+		   FROM tasks`,
+	)
+	if err != nil {
+		return AnomaliesResult{}, fmt.Errorf("query tasks: %w", err)
+	}
+	defer rows.Close()
+
+	all := []row{}
+	byID := map[int]row{}
+	allIDs := map[int]bool{}
+	for rows.Next() {
+		var r row
+		var dwJSON, bbJSON string
+		if err := rows.Scan(&r.id, &r.status, &r.mode, &r.workflow, &r.taskPlan, &dwJSON, &bbJSON, &r.createdAt); err != nil {
+			return AnomaliesResult{}, fmt.Errorf("scan tasks: %w", err)
+		}
+		r.doneWhen = parseIntArray(dwJSON) // placeholder — we only use len
+		if len(r.doneWhen) == 0 {
+			// done_when is []string; parseIntArray returns [] for anything
+			// that isn't a plain-int list, so we can't rely on it for
+			// existence. Re-check by parsing as string list.
+			var strs []string
+			_ = json.Unmarshal([]byte(dwJSON), &strs)
+			for range strs {
+				r.doneWhen = append(r.doneWhen, 0) // marker so len > 0
+			}
+		}
+		r.blockedBy = parseIntArray(bbJSON)
+		all = append(all, r)
+		byID[r.id] = r
+		allIDs[r.id] = true
+	}
+	if err := rows.Err(); err != nil {
+		return AnomaliesResult{}, err
+	}
+
+	// Parse cutoff date once. Everything after this stays deterministic.
+	nowStr := ""
+	if err := s.pool.QueryRow(ctx, `SELECT NOW()::date::text`).Scan(&nowStr); err != nil {
+		return AnomaliesResult{}, fmt.Errorf("now(): %w", err)
+	}
+	staleWorkflows := map[string]bool{"marketing": true, "research_task": true}
+
+	for _, t := range all {
+		if closedStatuses[strings.ToUpper(t.status)] {
+			continue
+		}
+
+		// BARE_BLOCKER: blocked_by id that isn't a real task.
+		for _, bid := range t.blockedBy {
+			if !allIDs[bid] {
+				res.BareBlocker = append(res.BareBlocker, fmt.Sprintf("#%d blocked_by #%d -- task #%d does not exist", t.id, bid, bid))
+			}
+		}
+
+		// NO_TASKPLAN: non-early-status Code/Think tasks lacking task_plan
+		// (skip marketing / research_task — they use brief.md).
+		if t.status != "BACKLOG" && t.status != "TODO" && t.status != "PLANNING" {
+			if (t.mode == "Code" || t.mode == "Think") && t.taskPlan == "" && !staleWorkflows[t.workflow] {
+				res.NoTaskPlan = append(res.NoTaskPlan, fmt.Sprintf("#%d is %s task in %s without task_plan", t.id, t.mode, t.status))
+			}
+		}
+
+		// STALE: TODO/IN_PROGRESS since created_at, >14 days.
+		if (t.status == "IN_PROGRESS" || t.status == "TODO") && t.createdAt != "" {
+			days := daysBetween(t.createdAt, nowStr)
+			if days > 14 {
+				res.Stale = append(res.Stale, fmt.Sprintf("#%d %s since %s (%d days)", t.id, t.status, t.createdAt, days))
+			}
+		}
+
+		// ORPHAN_DEP: blocked_by that is already DONE.
+		for _, bid := range t.blockedBy {
+			if b, ok := byID[bid]; ok && strings.ToUpper(b.status) == "DONE" {
+				res.OrphanDep = append(res.OrphanDep, fmt.Sprintf("#%d blocked_by #%d, but #%d is DONE", t.id, bid, bid))
+			}
+		}
+
+		// NO_DONEWHEN: non-early-status task with empty done_when.
+		if t.status != "BACKLOG" && t.status != "TODO" && t.status != "PLANNING" {
+			if len(t.doneWhen) == 0 {
+				res.NoDoneWhen = append(res.NoDoneWhen, fmt.Sprintf("#%d status %s but done_when is empty", t.id, t.status))
+			}
+		}
+	}
+	return res, nil
+}
+
+// daysBetween returns the whole-day delta between two YYYY-MM-DD strings.
+// Falls back to 0 on parse error (matches Python's silent skip on bad dates).
+func daysBetween(fromDate, toDate string) int {
+	if len(fromDate) < 10 || len(toDate) < 10 {
+		return 0
+	}
+	// Both prefixes are YYYY-MM-DD. Compare as time.Time; fmt.Sscanf would
+	// swallow the timezone bits which are harmless here.
+	const layout = "2006-01-02"
+	f, err := time.Parse(layout, fromDate[:10])
+	if err != nil {
+		return 0
+	}
+	t, err := time.Parse(layout, toDate[:10])
+	if err != nil {
+		return 0
+	}
+	return int(t.Sub(f).Hours() / 24)
 }
 
 // ---------------------------------------------------------------------------

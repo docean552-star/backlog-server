@@ -34,6 +34,7 @@ func New(cfg config.Config, st *store.Store) *Server {
 	r.Get("/task/{id}/history", s.handleHistory)
 	r.Get("/search", s.handleSearch)
 	r.Get("/analytics", s.handleAnalytics)
+	r.Get("/anomalies", s.handleAnomalies)
 	r.Get("/next/{agent}", s.handleNext)
 	r.Get("/status", s.handleStatus)
 	r.Post("/task/{id}/advance", s.handleAdvance)
