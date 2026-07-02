@@ -414,6 +414,31 @@ func (s *Server) handleRevision(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+// handleAnalytics — GET /analytics?agent=&period=Nd. Returns a thin JSON
+// subset of Python cmd_analytics: velocity (DONE per week over the period),
+// per-status counts, and by-agent totals (Done / Active / Blocked buckets).
+// Bottlenecks / time_in_status / cost sections stay on /exec.
+func (s *Server) handleAnalytics(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	agent := q.Get("agent")
+	// period is "Nd" like the CLI flag; parse Ndigit prefix, default 28.
+	period := 28
+	if p := q.Get("period"); p != "" {
+		p = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(p)), "d")
+		if n, err := strconv.Atoi(p); err == nil && n > 0 && n <= 3650 {
+			period = n
+		}
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	res, err := s.store.Analytics(ctx, agent, period)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
 // handleSearch — GET /search?owner=&status=&text=&limit=&sort=. Simplified
 // subset of Python cmd_search: no negation filters, no positional word AND
 // combos, no --client/--project. The CLI dispatcher falls back to /exec when

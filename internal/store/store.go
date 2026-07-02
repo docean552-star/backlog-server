@@ -1238,6 +1238,128 @@ func (s *Store) RequestRevision(ctx context.Context, taskID int, agent, reason s
 }
 
 // ---------------------------------------------------------------------------
+// analytics — thin subset of Python cmd_analytics (velocity + by-agent counts)
+// ---------------------------------------------------------------------------
+
+// AnalyticsResult is the JSON shape returned by GET /analytics.
+type AnalyticsResult struct {
+	Velocity     AnalyticsVelocity      `json:"velocity"`
+	ByAgent      []AnalyticsAgentRow    `json:"by_agent"`
+	StatusCounts map[string]int         `json:"status_counts"`
+}
+
+type AnalyticsVelocity struct {
+	PeriodDays    int     `json:"period_days"`
+	TotalClosed   int     `json:"total_closed"`
+	TasksPerWeek  float64 `json:"tasks_per_week"`
+}
+
+type AnalyticsAgentRow struct {
+	Owner    string `json:"owner"`
+	Total    int    `json:"total"`
+	Done     int    `json:"done"`
+	Active   int    `json:"active"`   // TODO/PLANNING/READY/IN_PROGRESS/REOPENED
+	Blocked  int    `json:"blocked"`  // BLOCKED / IN_REVIEW / AWAITING_APPROVAL
+}
+
+// Analytics returns a JSON-only slice of the Python cmd_analytics output:
+// velocity (DONE transitions in the last period_days), by-agent counts, and
+// per-status totals. Bottlenecks, time-in-status, and cost sections stay on
+// the /exec path — those are heavier queries with formatting overhead the
+// native endpoint intentionally does not try to match.
+//
+// periodDays defaults to 28 (cmd_analytics default). agent, when non-empty,
+// restricts the by-agent slice to that one row.
+func (s *Store) Analytics(ctx context.Context, agent string, periodDays int) (AnalyticsResult, error) {
+	if periodDays <= 0 {
+		periodDays = 28
+	}
+	res := AnalyticsResult{
+		Velocity:     AnalyticsVelocity{PeriodDays: periodDays},
+		ByAgent:      []AnalyticsAgentRow{},
+		StatusCounts: map[string]int{},
+	}
+
+	// Velocity: count DONE transitions in the window.
+	var closed int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM audit_trail
+		  WHERE field_changed = 'status' AND new_value = 'DONE'
+		    AND timestamp >= (NOW() - ($1 || ' days')::interval)::text`,
+		fmt.Sprintf("%d", periodDays),
+	).Scan(&closed); err != nil {
+		return AnalyticsResult{}, fmt.Errorf("velocity: %w", err)
+	}
+	res.Velocity.TotalClosed = closed
+	if periodDays > 0 {
+		res.Velocity.TasksPerWeek = round1(float64(closed) * 7.0 / float64(periodDays))
+	}
+
+	// Per-status counts. Reuses the same categorisation as /status but keeps
+	// them here so a single call yields everything an operator needs.
+	rows, err := s.pool.Query(ctx, `SELECT status, COUNT(*) FROM tasks GROUP BY status`)
+	if err != nil {
+		return AnalyticsResult{}, fmt.Errorf("status_counts: %w", err)
+	}
+	for rows.Next() {
+		var status string
+		var n int
+		if err := rows.Scan(&status, &n); err != nil {
+			rows.Close()
+			return AnalyticsResult{}, err
+		}
+		res.StatusCounts[status] = n
+	}
+	rows.Close()
+
+	// By-agent breakdown. Sum status buckets in a single scan so the query
+	// stays O(rows) rather than O(agents * statuses).
+	args := []any{}
+	where := ""
+	if agent != "" {
+		args = append(args, strings.ToLower(agent))
+		where = "WHERE lower(owner) = $1"
+	}
+	q := fmt.Sprintf(`SELECT owner, status, COUNT(*) FROM tasks %s GROUP BY owner, status`, where)
+	aRows, err := s.pool.Query(ctx, q, args...)
+	if err != nil {
+		return AnalyticsResult{}, fmt.Errorf("by_agent: %w", err)
+	}
+	byOwner := map[string]*AnalyticsAgentRow{}
+	for aRows.Next() {
+		var owner, status string
+		var n int
+		if err := aRows.Scan(&owner, &status, &n); err != nil {
+			aRows.Close()
+			return AnalyticsResult{}, err
+		}
+		row, ok := byOwner[owner]
+		if !ok {
+			row = &AnalyticsAgentRow{Owner: owner}
+			byOwner[owner] = row
+		}
+		row.Total += n
+		st := strings.ToUpper(status)
+		switch st {
+		case "DONE":
+			row.Done += n
+		case "TODO", "PLANNING", "READY", "IN_PROGRESS", "REOPENED":
+			row.Active += n
+		case "BLOCKED", "IN_REVIEW", "AWAITING_APPROVAL":
+			row.Blocked += n
+		}
+	}
+	aRows.Close()
+	for _, r := range byOwner {
+		res.ByAgent = append(res.ByAgent, *r)
+	}
+	// Deterministic order: by owner ASC so the JSON is diffable across calls.
+	sort.Slice(res.ByAgent, func(i, j int) bool { return res.ByAgent[i].Owner < res.ByAgent[j].Owner })
+
+	return res, nil
+}
+
+// ---------------------------------------------------------------------------
 // search — simplified subset of Python cmd_search
 // ---------------------------------------------------------------------------
 
