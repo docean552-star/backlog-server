@@ -1015,6 +1015,228 @@ func (s *Store) SubmitReview(ctx context.Context, taskID int, caller, reviewer, 
 	}, nil
 }
 
+// ---------------------------------------------------------------------------
+// verify / postmortem / revision — infra_fix + creative workflow helpers
+// ---------------------------------------------------------------------------
+
+// VerifyResult is what VerifyTask returns to the handler. The task field is
+// refetched post-commit so updated_at, reporter_verified, and (in the --failed
+// path) status reflect the DB row rather than the pre-mutation copy.
+type VerifyResult struct {
+	Task     Task                 `json:"task"`
+	Mode     string               `json:"mode"` // "positive" | "failed"
+	Reason   string               `json:"reason,omitempty"`
+	Failures []AdvanceGateFailure `json:"failures,omitempty"`
+}
+
+// VerifyTask records a reporter verification for an infra_fix task.
+//
+//   - Positive path (failed == ""): UPDATE reporter_verified=1 +
+//     reporter_verified_at=NOW() + audit row (field=reporter_verified).
+//   - Failed path (failed != ""): UPDATE status='INVESTIGATING' +
+//     reporter_verified=0 + reporter_verified_at=NULL + append VERIFY FAILED
+//     note to progress + audit row (field=status, command='verify --failed').
+//
+// The Python cmd_verify validates the transition to INVESTIGATING via
+// validate_transition and pages the task owner on failure. Neither is ported
+// yet: the transition check is a follow-up port (verifying a non-infra task
+// is a harmless no-op today per Python design), and the pager notification
+// belongs to a different concern.
+func (s *Store) VerifyTask(ctx context.Context, taskID int, agent, failed string) (VerifyResult, error) {
+	task, _, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		return VerifyResult{}, err
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return VerifyResult{}, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	mode := "positive"
+	if failed != "" {
+		mode = "failed"
+		// Failed path: send back to INVESTIGATING, clear reporter_verified,
+		// append the reason to progress. Progress accumulates newline-separated.
+		note := fmt.Sprintf("VERIFY FAILED: %s", failed)
+		from := strings.ToUpper(strings.TrimSpace(task.Status))
+		if _, err := tx.Exec(ctx,
+			`UPDATE tasks
+			   SET status = 'INVESTIGATING',
+			       reporter_verified = 0,
+			       reporter_verified_at = NULL,
+			       progress = TRIM(BOTH E'\n' FROM COALESCE(progress, '') || E'\n' || $1),
+			       updated_at = NOW()::text
+			 WHERE id = $2`,
+			note, taskID,
+		); err != nil {
+			return VerifyResult{}, fmt.Errorf("update: %w", err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO audit_trail (task_id, agent, field_changed, old_value, new_value, command, timestamp)
+			 VALUES ($1, $2, 'status', $3, 'INVESTIGATING', 'verify --failed', NOW()::text)`,
+			taskID, agent, from,
+		); err != nil {
+			return VerifyResult{}, fmt.Errorf("audit: %w", err)
+		}
+	} else {
+		// Positive path: set reporter_verified=1 + timestamp.
+		if _, err := tx.Exec(ctx,
+			`UPDATE tasks
+			   SET reporter_verified = 1,
+			       reporter_verified_at = NOW()::text,
+			       updated_at = NOW()::text
+			 WHERE id = $1`,
+			taskID,
+		); err != nil {
+			return VerifyResult{}, fmt.Errorf("update: %w", err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO audit_trail (task_id, agent, field_changed, old_value, new_value, command, timestamp)
+			 VALUES ($1, $2, 'reporter_verified', 'False', 'True', 'verify', NOW()::text)`,
+			taskID, agent,
+		); err != nil {
+			return VerifyResult{}, fmt.Errorf("audit: %w", err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return VerifyResult{}, fmt.Errorf("commit: %w", err)
+	}
+	if s.cache != nil {
+		s.cache.Bump()
+	}
+	updated, _, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		updated = task
+	}
+	return VerifyResult{Task: updated, Mode: mode, Reason: failed}, nil
+}
+
+// PostmortemResult mirrors VerifyResult shape without the Mode field.
+type PostmortemResult struct {
+	Task     Task                 `json:"task"`
+	Path     string               `json:"path"`
+	Failures []AdvanceGateFailure `json:"failures,omitempty"`
+}
+
+// SetPostmortem records the postmortem doc path for an infra_fix task. The
+// server has no local FS view of the spec_dir; existence-of-file warnings are
+// a client-side concern (Python cmd_postmortem prints them to stderr).
+func (s *Store) SetPostmortem(ctx context.Context, taskID int, agent, path string) (PostmortemResult, error) {
+	task, _, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		return PostmortemResult{}, err
+	}
+	oldPath := ""
+	// The Task struct doesn't expose postmortem_path today (not in read
+	// endpoints yet), so audit records old_value = "" for now. Audit still
+	// captures the new value which is what downstream consumers need.
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return PostmortemResult{}, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE tasks SET postmortem_path = $1, updated_at = NOW()::text WHERE id = $2`,
+		path, taskID,
+	); err != nil {
+		return PostmortemResult{}, fmt.Errorf("update: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO audit_trail (task_id, agent, field_changed, old_value, new_value, command, timestamp)
+		 VALUES ($1, $2, 'postmortem_path', $3, $4, 'postmortem', NOW()::text)`,
+		taskID, agent, oldPath, path,
+	); err != nil {
+		return PostmortemResult{}, fmt.Errorf("audit: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return PostmortemResult{}, fmt.Errorf("commit: %w", err)
+	}
+	if s.cache != nil {
+		s.cache.Bump()
+	}
+	updated, _, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		updated = task
+	}
+	return PostmortemResult{Task: updated, Path: path}, nil
+}
+
+// RevisionResult is what RequestRevision returns to the handler.
+type RevisionResult struct {
+	Task       Task                 `json:"task"`
+	FromStatus string               `json:"from_status"`
+	ToStatus   string               `json:"to_status"`
+	Reason     string               `json:"reason"`
+	Failures   []AdvanceGateFailure `json:"failures,omitempty"`
+}
+
+// RequestRevision moves an AWAITING_APPROVAL task sideways to REVISION with
+// the reason recorded in progress. REVISION is a sideways status only
+// reachable via this endpoint (see Python cmd_revision docstring).
+//
+// The server does NOT validate that the task's workflow declares REVISION as
+// an allowed target (Python reads TRANSITIONS[AWAITING_APPROVAL] for that).
+// For MVP the only source check is fromStatus == 'AWAITING_APPROVAL'; a
+// workflow-aware follow-up will tighten this.
+func (s *Store) RequestRevision(ctx context.Context, taskID int, agent, reason string) (RevisionResult, error) {
+	task, _, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		return RevisionResult{}, err
+	}
+	from := strings.ToUpper(strings.TrimSpace(task.Status))
+	if from != "AWAITING_APPROVAL" {
+		return RevisionResult{
+			Task: task, FromStatus: from, ToStatus: "REVISION", Reason: reason,
+			Failures: []AdvanceGateFailure{{
+				Check:  "TRANSITION",
+				Detail: fmt.Sprintf("revision is only available from AWAITING_APPROVAL (current: %s)", from),
+			}},
+		}, nil
+	}
+
+	note := fmt.Sprintf("REVISION requested: %s", reason)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return RevisionResult{}, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE tasks
+		   SET status = 'REVISION',
+		       progress = TRIM(BOTH E'\n' FROM COALESCE(progress, '') || E'\n' || $1),
+		       updated_at = NOW()::text
+		 WHERE id = $2`,
+		note, taskID,
+	); err != nil {
+		return RevisionResult{}, fmt.Errorf("update: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO audit_trail (task_id, agent, field_changed, old_value, new_value, command, timestamp)
+		 VALUES ($1, $2, 'status', $3, 'REVISION', 'revision', NOW()::text)`,
+		taskID, agent, from,
+	); err != nil {
+		return RevisionResult{}, fmt.Errorf("audit: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return RevisionResult{}, fmt.Errorf("commit: %w", err)
+	}
+	if s.cache != nil {
+		s.cache.Bump()
+	}
+	updated, _, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		updated = task
+		updated.Status = "REVISION"
+	}
+	return RevisionResult{Task: updated, FromStatus: from, ToStatus: "REVISION", Reason: reason}, nil
+}
+
 // updatableTextFields is the whitelist for safe UpdateTask targets. Excludes:
 //  - status (transition gates + auto-actions must run Python-side for now)
 //  - custom_fields (JSON merge semantics; Python has explicit merge logic)
