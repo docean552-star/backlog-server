@@ -1237,6 +1237,177 @@ func (s *Store) RequestRevision(ctx context.Context, taskID int, agent, reason s
 	return RevisionResult{Task: updated, FromStatus: from, ToStatus: "REVISION", Reason: reason}, nil
 }
 
+// ---------------------------------------------------------------------------
+// knowledge — ADR-style entries stored in knowledge_entries
+// ---------------------------------------------------------------------------
+
+// KnowledgeResult is what AddKnowledge returns to the handler.
+type KnowledgeResult struct {
+	ID           int64  `json:"id"`
+	TaskID       *int   `json:"task_id"`
+	Context      string `json:"context"`
+	Decision     string `json:"decision"`
+	Consequences string `json:"consequences"`
+	Source       string `json:"source"`
+	CreatedAt    string `json:"created_at"`
+}
+
+// AddKnowledge inserts an ADR-style row into knowledge_entries. task_id is
+// optional (schema allows NULL for orphan ADRs). Handler-level check enforces
+// that at least one of {context, decision, consequences} is non-empty to
+// avoid silent empty-row spam.
+//
+// No CLI wire yet — the existing `backlogist knowledge` subcommand covers
+// search only. Automatic entries are saved by the reviewer pipeline via
+// backlogist/core/knowledge.py::save_knowledge (unchanged, direct PG).
+func (s *Store) AddKnowledge(ctx context.Context, taskID *int, context_, decision, consequences, source string) (KnowledgeResult, error) {
+	var (
+		id        int64
+		createdAt string
+	)
+	err := s.pool.QueryRow(ctx,
+		`INSERT INTO knowledge_entries (task_id, context, decision, consequences, source, created_at)
+		 VALUES ($1, $2, $3, $4, $5, NOW()::text)
+		 RETURNING id, created_at`,
+		taskID, context_, decision, consequences, source,
+	).Scan(&id, &createdAt)
+	if err != nil {
+		return KnowledgeResult{}, fmt.Errorf("insert knowledge: %w", err)
+	}
+	if s.cache != nil {
+		s.cache.Bump()
+	}
+	return KnowledgeResult{
+		ID:           id,
+		TaskID:       taskID,
+		Context:      context_,
+		Decision:     decision,
+		Consequences: consequences,
+		Source:       source,
+		CreatedAt:    createdAt,
+	}, nil
+}
+
+// ---------------------------------------------------------------------------
+// freeze-update — intent versioning + history archival
+// ---------------------------------------------------------------------------
+
+// FreezeUpdateResult is what FreezeUpdate returns to the handler.
+type FreezeUpdateResult struct {
+	TaskID      int                  `json:"task_id"`
+	FromVersion int                  `json:"from_version"` // 0 when initialising
+	ToVersion   int                  `json:"to_version"`
+	Initialized bool                 `json:"initialized"` // true when frozen_intent was NULL
+	IntentText  string               `json:"intent_text"`
+	Failures    []AdvanceGateFailure `json:"failures,omitempty"`
+}
+
+// FreezeUpdate re-freezes a task's frozen_intent from the current note+why
+// with version history (parity with backlogist/core/intent_gate.py::freeze_update).
+//
+//   - If task.frozen_intent IS NULL: sets frozen_intent = new_intent,
+//     intent_source='operator', intent_version=1. No history row.
+//   - Otherwise: archives the current (version, intent_text, reason, author)
+//     to tasks_intent_history, then updates frozen_intent = new_intent and
+//     bumps intent_version.
+//
+// new_intent is re-read from the CURRENT task.note + task.why — caller must
+// update those first via `backlogist #N update ...`. Empty new_intent → 422
+// EMPTY_INTENT (parity with Python's BacklogistError).
+//
+// Author is hardcoded 'operator' (Python parity). Native does not thread
+// AX_AGENT into the history row; that's a small semantic drift worth a
+// follow-up if operators want per-agent attribution.
+func (s *Store) FreezeUpdate(ctx context.Context, taskID int, agent, reason string) (FreezeUpdateResult, error) {
+	// Read the columns we need directly (Task struct doesn't expose the
+	// intent-* fields yet; adding them to the read endpoints is a separate change).
+	var (
+		note          string
+		why           string
+		currentFrozen *string
+		currentVer    int
+	)
+	err := s.pool.QueryRow(ctx,
+		`SELECT COALESCE(note, ''), COALESCE(why, ''), frozen_intent, intent_version FROM tasks WHERE id = $1`,
+		taskID,
+	).Scan(&note, &why, &currentFrozen, &currentVer)
+	if err != nil {
+		return FreezeUpdateResult{}, err
+	}
+	newIntent := strings.TrimSpace(strings.TrimSpace(note) + "\n" + strings.TrimSpace(why))
+	if newIntent == "" {
+		return FreezeUpdateResult{
+			TaskID: taskID, FromVersion: currentVer, ToVersion: currentVer,
+			Failures: []AdvanceGateFailure{{
+				Check:  "EMPTY_INTENT",
+				Detail: "Cannot freeze: task.note and task.why are both empty. Update them first: backlogist #" + fmt.Sprintf("%d", taskID) + " update note:\"…\"",
+			}},
+		}, nil
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return FreezeUpdateResult{}, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	initialized := currentFrozen == nil
+	fromVer := currentVer
+	toVer := currentVer
+	if initialized {
+		// Fresh task — set intent + reset version to 1 (the default is already 1
+		// but this makes the write explicit and idempotent against schemas where
+		// the default may have changed).
+		if _, err := tx.Exec(ctx,
+			`UPDATE tasks
+			   SET frozen_intent = $1,
+			       intent_source = 'operator',
+			       intent_version = 1,
+			       updated_at = NOW()::text
+			 WHERE id = $2`,
+			newIntent, taskID,
+		); err != nil {
+			return FreezeUpdateResult{}, fmt.Errorf("update tasks: %w", err)
+		}
+		fromVer = 0 // Signal "was NULL"
+		toVer = 1
+	} else {
+		// Archive the current version, then bump.
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO tasks_intent_history (task_id, version, intent_text, reason, author)
+			 VALUES ($1, $2, $3, $4, 'operator')`,
+			taskID, currentVer, *currentFrozen, reason,
+		); err != nil {
+			return FreezeUpdateResult{}, fmt.Errorf("insert history: %w", err)
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE tasks
+			   SET frozen_intent = $1,
+			       intent_version = intent_version + 1,
+			       updated_at = NOW()::text
+			 WHERE id = $2`,
+			newIntent, taskID,
+		); err != nil {
+			return FreezeUpdateResult{}, fmt.Errorf("update tasks: %w", err)
+		}
+		toVer = currentVer + 1
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return FreezeUpdateResult{}, fmt.Errorf("commit: %w", err)
+	}
+	if s.cache != nil {
+		s.cache.Bump()
+	}
+	return FreezeUpdateResult{
+		TaskID:      taskID,
+		FromVersion: fromVer,
+		ToVersion:   toVer,
+		Initialized: initialized,
+		IntentText:  newIntent,
+	}, nil
+}
+
 // updatableTextFields is the whitelist for safe UpdateTask targets. Excludes:
 //  - status (transition gates + auto-actions must run Python-side for now)
 //  - custom_fields (JSON merge semantics; Python has explicit merge logic)

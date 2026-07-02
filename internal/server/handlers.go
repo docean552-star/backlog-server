@@ -414,6 +414,83 @@ func (s *Server) handleRevision(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+// handleKnowledge — POST /knowledge. Body:
+// {task_id?, context, decision, consequences, source?}. 400 if all of
+// context/decision/consequences are empty (nothing to save).
+func (s *Server) handleKnowledge(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		TaskID       *int   `json:"task_id"`
+		Context      string `json:"context"`
+		Decision     string `json:"decision"`
+		Consequences string `json:"consequences"`
+		Source       string `json:"source"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+		return
+	}
+	req.Context = strings.TrimSpace(req.Context)
+	req.Decision = strings.TrimSpace(req.Decision)
+	req.Consequences = strings.TrimSpace(req.Consequences)
+	req.Source = strings.TrimSpace(req.Source)
+	if req.Context == "" && req.Decision == "" && req.Consequences == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "at least one of context/decision/consequences required"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	res, err := s.store.AddKnowledge(ctx, req.TaskID, req.Context, req.Decision, req.Consequences, req.Source)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// handleFreezeUpdate — POST /task/{id}/freeze-update. Body: {agent, reason}.
+// reason required (400); note+why both empty on the target → 422 EMPTY_INTENT.
+func (s *Server) handleFreezeUpdate(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id must be integer"})
+		return
+	}
+	var req struct {
+		Agent  string `json:"agent"`
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+		return
+	}
+	req.Agent = strings.TrimSpace(req.Agent)
+	req.Reason = strings.TrimSpace(req.Reason)
+	if req.Agent == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "agent required"})
+		return
+	}
+	if req.Reason == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "reason required"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	res, err := s.store.FreezeUpdate(ctx, id, req.Agent, req.Reason)
+	if err != nil {
+		if store.IsNotFound(err) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "task not found", "id": id})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if len(res.Failures) > 0 {
+		writeJSON(w, http.StatusUnprocessableEntity, res)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
 // handleUpdate — PATCH /task/{id}. Body: {agent, updates: {field: value}}.
 // Supports only whitelisted text fields (see store.updatableTextFields).
 // Complex updates (status transitions, custom_fields merge, JSON list columns)
