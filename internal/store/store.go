@@ -1238,6 +1238,81 @@ func (s *Store) RequestRevision(ctx context.Context, taskID int, agent, reason s
 }
 
 // ---------------------------------------------------------------------------
+// search — simplified subset of Python cmd_search
+// ---------------------------------------------------------------------------
+
+// searchSortFields is the allow-list for the ?sort= query param. Anything
+// outside falls back to effective_score (cmd_search default). Restricting
+// the set here is deliberate: the frontend never asks to sort by JSON
+// columns (blocked_by, done_when) and letting an arbitrary column name
+// through would open an SQL-injection edge case on the ORDER BY clause.
+var searchSortFields = map[string]bool{
+	"effective_score": true,
+	"updated_at":      true,
+	"created_at":      true,
+	"id":              true,
+	"status":          true,
+	"owner":           true,
+	"title":           true,
+}
+
+// SearchTasks is the native counterpart to Python cmd_search's happy path:
+// owner + status + free-text (matched against title/why/note) with an ORDER
+// BY + LIMIT. Negation filters, positional word AND-combos, and
+// --client/--project soft-refs stay on /exec — the CLI dispatcher only picks
+// the native path when the incoming request fits inside this shape.
+//
+// text is matched with ILIKE '%text%' against title/why/note (case-
+// insensitive, matches Python's LIKE + upper()/lower() call sites).
+func (s *Store) SearchTasks(ctx context.Context, owner, status, text, sort string, limit int) ([]Task, error) {
+	clauses := []string{}
+	args := []any{}
+	if owner != "" {
+		args = append(args, strings.ToLower(owner))
+		clauses = append(clauses, fmt.Sprintf("lower(owner) = $%d", len(args)))
+	}
+	if status != "" {
+		args = append(args, strings.ToUpper(status))
+		clauses = append(clauses, fmt.Sprintf("status = $%d", len(args)))
+	}
+	if text != "" {
+		args = append(args, "%"+text+"%")
+		p := len(args)
+		clauses = append(clauses, fmt.Sprintf("(title ILIKE $%d OR why ILIKE $%d OR note ILIKE $%d)", p, p, p))
+	}
+	where := ""
+	if len(clauses) > 0 {
+		where = "WHERE " + strings.Join(clauses, " AND ")
+	}
+	sort = strings.ToLower(strings.TrimSpace(sort))
+	if !searchSortFields[sort] {
+		sort = "effective_score"
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 50
+	}
+	args = append(args, limit)
+	q := fmt.Sprintf(
+		"SELECT %s FROM tasks %s ORDER BY %s DESC NULLS LAST LIMIT $%d",
+		taskColumns, where, sort, len(args),
+	)
+	rows, err := s.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query search: %w", err)
+	}
+	defer rows.Close()
+	out := []Task{}
+	for rows.Next() {
+		t, err := scanTask(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan search: %w", err)
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
 // history — audit_trail rows for a task
 // ---------------------------------------------------------------------------
 

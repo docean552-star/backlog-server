@@ -414,6 +414,28 @@ func (s *Server) handleRevision(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+// handleSearch — GET /search?owner=&status=&text=&limit=&sort=. Simplified
+// subset of Python cmd_search: no negation filters, no positional word AND
+// combos, no --client/--project. The CLI dispatcher falls back to /exec when
+// the caller's query shape falls outside this set.
+func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	limit := 0
+	if l := q.Get("limit"); l != "" {
+		if n, err := strconv.Atoi(l); err == nil && n > 0 && n <= 1000 {
+			limit = n
+		}
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	tasks, err := s.store.SearchTasks(ctx, q.Get("owner"), q.Get("status"), q.Get("text"), q.Get("sort"), limit)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, tasks)
+}
+
 // handleHistory — GET /task/{id}/history?limit=N. Returns audit_trail rows
 // for the task, oldest first. Missing task → empty array (no 404), matching
 // audit-feed semantics.
