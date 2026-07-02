@@ -100,10 +100,12 @@ func (s *Server) handleNext(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAdvance is the first native write endpoint (POST /task/{id}/advance).
-// It runs the server-side DB gates (done_when non-empty + latest spec-reviewer
-// PASS for PLANNING → READY) and UPDATE + audit-trail atomically. File-based
-// gates (research.md content, task_plan KQ/TS count) are the client's job —
-// the server never touches specs on disk. See store.AdvanceTask godoc.
+// It runs the server-side DB gates and UPDATE + audit-trail atomically.
+// Body: {agent, approve?}. `approve` is optional (default false) and only
+// matters for the AWAITING_APPROVAL → DONE transition, where it maps to the
+// CLI's --approve flag; other transitions ignore it. File-based gates
+// (research.md content, task_plan KQ/TS count) are the client's job — the
+// server never touches specs on disk. See store.AdvanceTask godoc.
 func (s *Server) handleAdvance(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.Atoi(chi.URLParam(r, "id"))
 	if err != nil {
@@ -111,7 +113,8 @@ func (s *Server) handleAdvance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Agent string `json:"agent"`
+		Agent   string `json:"agent"`
+		Approve bool   `json:"approve"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
@@ -124,7 +127,7 @@ func (s *Server) handleAdvance(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
 	defer cancel()
-	res, err := s.store.AdvanceTask(ctx, id, req.Agent)
+	res, err := s.store.AdvanceTask(ctx, id, req.Agent, req.Approve)
 	if err != nil {
 		if store.IsNotFound(err) {
 			writeJSON(w, http.StatusNotFound, map[string]any{"error": "task not found", "id": id})

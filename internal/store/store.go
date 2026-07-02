@@ -527,12 +527,19 @@ type AdvanceResult struct {
 //   - pgx.ErrNoRows if the task doesn't exist
 //   - any other error from the DB
 //
-// The scope of gate checks in MVP is intentionally narrow (code_task only,
-// PLANNING → READY only): done_when non-empty + spec-reviewer PASS. File-based
-// checks (research.md content quality, task_plan KQ/TS count, agent markers)
-// remain a client-side concern — client should refuse to POST /advance if its
-// own local check finds those missing.
-func (s *Store) AdvanceTask(ctx context.Context, taskID int, agent string) (AdvanceResult, error) {
+// Gate coverage (code_task workflow only):
+//   - PLANNING → READY: done_when non-empty + latest spec-reviewer PASS verdict.
+//   - AWAITING_APPROVAL → DONE: caller must set approve=true (mirrors the CLI's
+//     --approve flag, i.e. operator explicit consent) AND task must have a
+//     latest task-closure-reviewer PASS verdict. Also sets closed_at=NOW().
+//
+// Other transitions (READY→IN_PROGRESS, IN_PROGRESS→IN_REVIEW, IN_REVIEW→
+// AWAITING_APPROVAL) still pass through without server-side gates — client-side
+// checks in Python cmd_advance enforce them. Full parity is a follow-up.
+//
+// File-based checks (research.md content quality, task_plan KQ/TS count, agent
+// markers) remain a client-side concern — the server has no local FS access.
+func (s *Store) AdvanceTask(ctx context.Context, taskID int, agent string, approve bool) (AdvanceResult, error) {
 	task, _, err := s.GetTask(ctx, taskID)
 	if err != nil {
 		return AdvanceResult{}, err
@@ -552,8 +559,7 @@ func (s *Store) AdvanceTask(ctx context.Context, taskID int, agent string) (Adva
 		}, nil
 	}
 
-	// Server-side DB gates. MVP covers PLANNING → READY. Other transitions
-	// pass through with no server-side check (client-side gates still enforce).
+	// Server-side DB gates.
 	var failures []AdvanceGateFailure
 	if fromStatus == "PLANNING" && to == "READY" {
 		if len(task.DoneWhen) == 0 {
@@ -573,6 +579,29 @@ func (s *Store) AdvanceTask(ctx context.Context, taskID int, agent string) (Adva
 			})
 		}
 	}
+	// AWAITING_APPROVAL → DONE: closure gate. This one is load-bearing — plain
+	// advance would previously walk past it silently (A's #1324 empirical
+	// observation, samvel-32). Two independent checks (both must pass):
+	//   - approve=true from the caller (proxy for the operator's --approve flag)
+	//   - latest task-closure-reviewer PASS verdict
+	if fromStatus == "AWAITING_APPROVAL" && to == "DONE" {
+		if !approve {
+			failures = append(failures, AdvanceGateFailure{
+				Check:  "APPROVE",
+				Detail: fmt.Sprintf("operator --approve required for AWAITING_APPROVAL → DONE (use: backlogist #%d advance --approve)", taskID),
+			})
+		}
+		hasPass, err := s.HasLatestVerdict(ctx, taskID, "task-closure-reviewer", "PASS")
+		if err != nil {
+			return AdvanceResult{}, fmt.Errorf("verdict lookup: %w", err)
+		}
+		if !hasPass {
+			failures = append(failures, AdvanceGateFailure{
+				Check:  "CLOSURE_REVIEW",
+				Detail: fmt.Sprintf("no latest task-closure-reviewer PASS verdict. Run @task-closure-reviewer, then: backlogist review-submit #%d --agent task-closure-reviewer --verdict PASS", taskID),
+			})
+		}
+	}
 	if len(failures) > 0 {
 		return AdvanceResult{Task: task, FromStatus: fromStatus, ToStatus: to, Failures: failures}, nil
 	}
@@ -584,10 +613,14 @@ func (s *Store) AdvanceTask(ctx context.Context, taskID int, agent string) (Adva
 	}
 	defer tx.Rollback(ctx) // no-op after commit
 
-	if _, err := tx.Exec(ctx,
-		`UPDATE tasks SET status = $1, updated_at = NOW()::text WHERE id = $2`,
-		to, taskID,
-	); err != nil {
+	// closed_at is set on the DONE transition. For all other targets the column
+	// stays untouched (NULL on new rows, previously set on cancel/supersede
+	// remains).
+	updateSQL := `UPDATE tasks SET status = $1, updated_at = NOW()::text WHERE id = $2`
+	if to == "DONE" {
+		updateSQL = `UPDATE tasks SET status = $1, updated_at = NOW()::text, closed_at = NOW()::text WHERE id = $2`
+	}
+	if _, err := tx.Exec(ctx, updateSQL, to, taskID); err != nil {
 		return AdvanceResult{}, fmt.Errorf("update tasks: %w", err)
 	}
 	if _, err := tx.Exec(ctx,
