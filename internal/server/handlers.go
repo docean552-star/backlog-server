@@ -729,6 +729,52 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, counts)
 }
 
+// handleSubtasksFromPlan — POST /task/{id}/subtasks-from-plan.
+// Body: {agent, dry_run?}. Reads parent's task_plan.md from disk, parses
+// "### Phase N: Title" sections + "- [ ] item" checklists, creates one
+// subtask per phase. Parent REOPENED if it was DONE.
+//
+// 400: malformed body / missing agent.
+// 404: parent not found.
+// 422: SPEC_MISSING (no task_plan file at task.task_plan or convention path).
+// 200: success + { task_id, spec_path, phases[], parent_reopened, dry_run }.
+func (s *Server) handleSubtasksFromPlan(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id must be integer"})
+		return
+	}
+	var req struct {
+		Agent  string `json:"agent"`
+		DryRun bool   `json:"dry_run"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+		return
+	}
+	req.Agent = strings.TrimSpace(req.Agent)
+	if req.Agent == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "agent required"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	res, err := s.store.SubtasksFromPlan(ctx, id, req.Agent, req.DryRun)
+	if err != nil {
+		if store.IsNotFound(err) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "task not found", "id": id})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if len(res.Failures) > 0 {
+		writeJSON(w, http.StatusUnprocessableEntity, res)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
 // handleMerge — POST /task/{id}/merge. Body: {absorbed_id, agent, dry_run?}.
 //
 // Absorbs task B (absorbed_id) into task A (path id):

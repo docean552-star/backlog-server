@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -14,6 +17,13 @@ import (
 
 	"github.com/docean552-star/backlog-server/internal/cache"
 )
+
+// axFSRoot is the on-disk root of the ax/ checkout that server-side handlers
+// read spec/plan files from. Matches proxy.go's execWorkDir. Handlers that
+// touch files (subtasks-from-plan) resolve relative task.task_plan paths
+// against this root. Server-side git pull (proxy.go:121-131) refreshes this
+// tree before every /exec, so files pushed by agents are visible quickly.
+const axFSRoot = "/opt/apps/ax"
 
 // Active statuses recognised by Python `recommend_next` (recommendations.py:69).
 var activeStatuses = map[string]bool{
@@ -2529,4 +2539,246 @@ func toJSONArrayStrings(v []string) string {
 	}
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+// ---------------------------------------------------------------------------
+// SubtasksFromPlan: parse Phase headers from task_plan.md and INSERT subtasks
+// ---------------------------------------------------------------------------
+
+// SubtasksFromPlanPhase reports one phase parsed from task_plan.md and its
+// created subtask (id=0 in dry_run).
+type SubtasksFromPlanPhase struct {
+	Num       string `json:"num"`
+	Title     string `json:"title"`
+	SubtaskID int    `json:"subtask_id"`
+	Items     int    `json:"items"`
+}
+
+// SubtasksFromPlanResult is the shape returned to the client.
+type SubtasksFromPlanResult struct {
+	TaskID         int                    `json:"task_id"`
+	SpecPath       string                 `json:"spec_path"`
+	Phases         []SubtasksFromPlanPhase `json:"phases"`
+	ParentReopened bool                   `json:"parent_reopened"`
+	DryRun         bool                   `json:"dry_run"`
+	Failures       []AdvanceGateFailure   `json:"failures,omitempty"`
+}
+
+// phaseHeaderRE mirrors Python re.compile(r"^###?\s+Phase\s+(\d+[\.\d]*):?\s*(.*)")
+// with re.MULTILINE. Go regexp needs (?m) prefix and separate flags.
+var phaseHeaderRE = regexp.MustCompile(`(?m)^###?\s+Phase\s+(\d+[\.\d]*):?\s*(.*)`)
+
+// checklistRE mirrors Python re.compile(r"^\s*-\s*\[\s*\]\s+(.+)") multi-line.
+var checklistRE = regexp.MustCompile(`(?m)^\s*-\s*\[\s*\]\s+(.+)`)
+
+// SubtasksFromPlan reads the parent's task_plan.md, parses "### Phase N: Title"
+// sections + their "- [ ] item" checklists, and creates one subtask per phase
+// in a single transaction. Parent is REOPENED if it was DONE.
+//
+// task_plan resolution:
+//  1. task.TaskPlan (if non-empty) — relative to axFSRoot.
+//  2. Convention fallback: docs/specs/{owner_lower}-{id}/task_plan.md.
+//
+// If neither exists returns 422 SPEC_MISSING (client emits helpful message).
+//
+// Semantics ported from ax/backlogist/core/commands.py:2896 cmd_subtasks_from_plan:
+//   - done_when per subtask capped to first 10 checklist items.
+//   - subtask title = "#{parent_id}.{phase_num}: {phase_title}".
+//   - subtask why = "Phase {phase_num} of #{parent_id} ({parent_title})".
+//   - workflow/mode/session inherited from parent (workflow defaults to "code_task").
+//   - tags inherited (from a raw SELECT since not on Task struct).
+//   - Parent DONE → REOPENED (client sees parent_reopened=true).
+//
+// Not ported:
+//   - export_yaml() — native callers work through HTTP.
+//   - stderr print "Parent reopened..." — parent_reopened bool suffices.
+//   - Direct edit of task.task_plan when using convention fallback — the
+//     Python side does that as a side effect; here we only report resolved
+//     spec_path in the response so the client can PATCH if desired.
+func (s *Store) SubtasksFromPlan(ctx context.Context, taskID int, agent string, dryRun bool) (SubtasksFromPlanResult, error) {
+	task, _, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		return SubtasksFromPlanResult{}, err
+	}
+
+	// Resolve task_plan path.
+	rel := strings.TrimSpace(task.TaskPlan)
+	if rel == "" {
+		// Convention: docs/specs/{owner_lower}-{id}/task_plan.md.
+		owner := strings.ToLower(strings.TrimSpace(task.Owner))
+		if owner == "" {
+			return SubtasksFromPlanResult{
+				TaskID: taskID, DryRun: dryRun,
+				Failures: []AdvanceGateFailure{{
+					Check:  "SPEC_MISSING",
+					Detail: "task has no task_plan and no owner for convention fallback",
+				}},
+			}, nil
+		}
+		rel = fmt.Sprintf("docs/specs/%s-%d/task_plan.md", owner, taskID)
+	}
+	full := filepath.Join(axFSRoot, rel)
+	content, err := os.ReadFile(full)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return SubtasksFromPlanResult{
+				TaskID: taskID, SpecPath: rel, DryRun: dryRun,
+				Failures: []AdvanceGateFailure{{
+					Check:  "SPEC_MISSING",
+					Detail: fmt.Sprintf("task_plan not found at %s", rel),
+				}},
+			}, nil
+		}
+		return SubtasksFromPlanResult{}, fmt.Errorf("read task_plan %s: %w", rel, err)
+	}
+
+	// Parse Phase headers + section content per phase.
+	matches := phaseHeaderRE.FindAllSubmatchIndex(content, -1)
+	if len(matches) == 0 {
+		return SubtasksFromPlanResult{
+			TaskID: taskID, SpecPath: rel, DryRun: dryRun,
+			Phases: []SubtasksFromPlanPhase{},
+		}, nil
+	}
+
+	type parsedPhase struct {
+		num   string
+		title string
+		items []string
+	}
+	phases := make([]parsedPhase, 0, len(matches))
+	for i, m := range matches {
+		numStart, numEnd := m[2], m[3]
+		titleStart, titleEnd := m[4], m[5]
+		num := string(content[numStart:numEnd])
+		title := strings.TrimSpace(string(content[titleStart:titleEnd]))
+		if title == "" {
+			title = fmt.Sprintf("Phase %s", num)
+		}
+		// Section = between this phase's header end and next phase's header start (or EOF).
+		sectionStart := m[1] // FindAllSubmatchIndex m[1] is the end of the outermost match
+		var sectionEnd int
+		if i+1 < len(matches) {
+			sectionEnd = matches[i+1][0]
+		} else {
+			sectionEnd = len(content)
+		}
+		section := content[sectionStart:sectionEnd]
+		itemMatches := checklistRE.FindAllSubmatch(section, -1)
+		items := make([]string, 0, len(itemMatches))
+		for _, im := range itemMatches {
+			items = append(items, strings.TrimSpace(string(im[1])))
+		}
+		phases = append(phases, parsedPhase{num: num, title: title, items: items})
+	}
+
+	if dryRun {
+		out := make([]SubtasksFromPlanPhase, 0, len(phases))
+		for _, p := range phases {
+			out = append(out, SubtasksFromPlanPhase{
+				Num: p.num, Title: p.title, SubtaskID: 0, Items: len(p.items),
+			})
+		}
+		return SubtasksFromPlanResult{
+			TaskID: taskID, SpecPath: rel, Phases: out, DryRun: true,
+		}, nil
+	}
+
+	// Fetch parent's tags + session (not on Task struct) for inheritance.
+	var tagsJSON, session string
+	if err := s.pool.QueryRow(ctx,
+		`SELECT tags, session FROM tasks WHERE id = $1`, taskID,
+	).Scan(&tagsJSON, &session); err != nil {
+		return SubtasksFromPlanResult{}, fmt.Errorf("load parent tags/session: %w", err)
+	}
+	// tags stored as text; pass through as-is (already valid JSON).
+	workflow := task.Workflow
+	if workflow == "" {
+		workflow = "code_task"
+	}
+	mode := task.Mode
+	if mode == "" {
+		mode = "Code"
+	}
+	nowDate := time.Now().UTC().Format("2006-01-02")
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return SubtasksFromPlanResult{}, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Catch up the SERIAL sequence in case Python next_id() (MAX+1 pattern) has
+	// been advancing IDs without incrementing the sequence. Safe/idempotent.
+	if _, err := tx.Exec(ctx,
+		`SELECT setval(pg_get_serial_sequence('tasks','id'),
+		               COALESCE((SELECT MAX(id) FROM tasks), 1))`,
+	); err != nil {
+		return SubtasksFromPlanResult{}, fmt.Errorf("setval id seq: %w", err)
+	}
+
+	out := make([]SubtasksFromPlanPhase, 0, len(phases))
+	for _, p := range phases {
+		items := p.items
+		if len(items) > 10 {
+			items = items[:10]
+		}
+		title := fmt.Sprintf("#%d.%s: %s", taskID, p.num, p.title)
+		why := fmt.Sprintf("Phase %s of #%d (%s)", p.num, taskID, task.Title)
+		doneJSON := toJSONArrayStrings(items)
+		var newID int
+		if err := tx.QueryRow(ctx,
+			`INSERT INTO tasks
+			     (title, why, owner, status, mode, workflow, done_when, tags,
+			      parent_task_id, session, created, created_at, updated_at)
+			 VALUES ($1, $2, $3, 'BACKLOG', $4, $5, $6, $7, $8, $9, $10, NOW()::text, NOW()::text)
+			 RETURNING id`,
+			title, why, task.Owner, mode, workflow, doneJSON, tagsJSON,
+			taskID, session, nowDate,
+		).Scan(&newID); err != nil {
+			return SubtasksFromPlanResult{}, fmt.Errorf("insert subtask (phase %s): %w", p.num, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO audit_trail (task_id, agent, field_changed, old_value, new_value, command, timestamp)
+			 VALUES ($1, $2, 'status', '', 'BACKLOG', $3, NOW()::text)`,
+			newID, agent, fmt.Sprintf("subtask-from-plan (phase %s)", p.num),
+		); err != nil {
+			return SubtasksFromPlanResult{}, fmt.Errorf("audit subtask %d: %w", newID, err)
+		}
+		out = append(out, SubtasksFromPlanPhase{
+			Num: p.num, Title: p.title, SubtaskID: newID, Items: len(items),
+		})
+	}
+
+	// Reopen parent if it was DONE. Python cmd_subtasks_from_plan does this
+	// with a stderr warning; we return parent_reopened=true and let the client
+	// print an appropriate note.
+	parentReopened := false
+	if strings.ToUpper(strings.TrimSpace(task.Status)) == "DONE" {
+		if _, err := tx.Exec(ctx,
+			`UPDATE tasks SET status = 'REOPENED', updated_at = NOW()::text, closed_at = NULL WHERE id = $1`,
+			taskID,
+		); err != nil {
+			return SubtasksFromPlanResult{}, fmt.Errorf("reopen parent: %w", err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO audit_trail (task_id, agent, field_changed, old_value, new_value, command, timestamp)
+			 VALUES ($1, $2, 'status', 'DONE', 'REOPENED', 'subtasks-from-plan: parent reopened (children created)', NOW()::text)`,
+			taskID, agent,
+		); err != nil {
+			return SubtasksFromPlanResult{}, fmt.Errorf("audit reopen: %w", err)
+		}
+		parentReopened = true
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return SubtasksFromPlanResult{}, fmt.Errorf("commit: %w", err)
+	}
+	if s.cache != nil {
+		s.cache.Bump()
+	}
+	return SubtasksFromPlanResult{
+		TaskID: taskID, SpecPath: rel, Phases: out, ParentReopened: parentReopened,
+		DryRun: false,
+	}, nil
 }
