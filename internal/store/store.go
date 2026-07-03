@@ -581,9 +581,10 @@ type AdvanceResult struct {
 //
 // Gate coverage (code_task workflow only):
 //   - PLANNING → READY: done_when non-empty + latest spec-reviewer PASS verdict.
-//   - READY → IN_PROGRESS: research_task requires done_when; other workflows
-//     pass server-side (canonical path is `take`, not advance). code_task/smm_task
-//     FS-based checks (test file oracle, task_plan KQ) still live in /exec.
+//   - READY → IN_PROGRESS: pass through with audit_trail only. Python's gate
+//     is entirely FS-based (test_oracle git commits, task_plan KQ parse,
+//     brief.md). Callers who want the full check chain use /exec. Canonical
+//     path for code_task is `take` (atomic status+owner).
 //   - IN_PROGRESS → IN_REVIEW: latest code-reviewer PASS verdict (load-bearing
 //     DB gate). FS-based checks (git commits mentioning task ID, test file
 //     existence, refactor commit reminder, copy scan) stay in /exec.
@@ -638,21 +639,14 @@ func (s *Store) AdvanceTask(ctx context.Context, taskID int, agent string, appro
 			})
 		}
 	}
-	// READY → IN_PROGRESS: minimal DB gate. Only research_task needs done_when
-	// server-side here (research has no READY→dwell — gate must fire on entry).
-	// For code_task/smm_task, canonical path is `take` (sets IN_PROGRESS + owner
-	// atomically). If someone `advance`s from READY server-side, FS checks
-	// (test_oracle, task_plan KQ) live in /exec — we don't fail-open in a way
-	// that hides them; callers who want the full chain use /exec.
-	if fromStatus == "READY" && to == "IN_PROGRESS" {
-		wf := strings.ToLower(strings.TrimSpace(task.Workflow))
-		if wf == "research_task" && len(task.DoneWhen) == 0 {
-			failures = append(failures, AdvanceGateFailure{
-				Check:  "DONE_WHEN",
-				Detail: fmt.Sprintf("research needs done_when before starting. Run: backlogist #%d update done_when:\"…\"", taskID),
-			})
-		}
-	}
+	// READY → IN_PROGRESS: no DB gate for code_task.
+	// Python's _check_to_in_progress is entirely FS-based (test_oracle git
+	// commits, task_plan KQ parse, brief.md existence per workflow) — none of
+	// these can be done cleanly from the server without either mounting the ax/
+	// tree read/write or duplicating the git-log convention. Callers who want
+	// the full check chain use /exec. Canonical path for code_task is `take`,
+	// not advance from READY. Left as no-op to keep the transition atomic in
+	// audit_trail; parity gap documented in the function godoc.
 	// IN_PROGRESS → IN_REVIEW: load-bearing DB gate = latest code-reviewer PASS.
 	// Python also checks git commits, test files, refactor reminder, copy scan
 	// — those stay on /exec (FS/git dependent). Native focuses on the one gate
