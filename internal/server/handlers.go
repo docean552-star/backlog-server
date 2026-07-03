@@ -828,3 +828,92 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, res)
 }
+
+// handleSMMTrigger — POST /smm/trigger. Body: {job?, agent?}.
+//
+// job defaults to "pipeline" (full 5-step smm-daily-monitor.sh). MVP scope
+// covers only "pipeline"; "content_agent" (step-5-only) is deferred.
+// agent defaults to "unknown" if the client doesn't send one.
+//
+// 202: {run_id, job, status:"queued"}. Client polls GET /smm/runs/{run_id}.
+// 400: unsupported job value.
+// 500: mkdir/spawn failure (rare — filesystem or wrapper missing).
+func (s *Server) handleSMMTrigger(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Job   string `json:"job"`
+		Agent string `json:"agent"`
+	}
+	// Body is optional — an empty POST is valid and triggers a pipeline run.
+	if r.ContentLength > 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+			return
+		}
+	}
+	req.Job = strings.TrimSpace(req.Job)
+	req.Agent = strings.TrimSpace(req.Agent)
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	res, err := s.store.TriggerSMM(ctx, req.Job, req.Agent)
+	if err != nil {
+		if strings.HasPrefix(err.Error(), "job must be") {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, res)
+}
+
+// handleSMMGetRun — GET /smm/runs/{id}.
+//
+// Reads wrapper-maintained state file at /opt/apps/ax/runs/{id}.json.
+// Populates log_tail (last ~50 lines of run log). Watchdogs zombies:
+// running with a dead PID → auto-marked failed with exit_code=-1.
+func (s *Server) handleSMMGetRun(w http.ResponseWriter, r *http.Request) {
+	runID := chi.URLParam(r, "id")
+	if runID == "" || strings.ContainsAny(runID, "./\\") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid run_id"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	res, err := s.store.GetSMMRun(ctx, runID)
+	if err != nil {
+		if err == store.ErrRunNotFound {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "run_id not found", "run_id": runID})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// handleSMMGetReport — GET /smm/reports/{slug}/{date}.
+//
+// Thin file server for /opt/apps/ax/output/smm/clients/{slug}/reports/{date}.json.
+// Slug and date are sanitised against ../ and /. Response is raw JSON.
+func (s *Server) handleSMMGetReport(w http.ResponseWriter, r *http.Request) {
+	slug := chi.URLParam(r, "slug")
+	date := chi.URLParam(r, "date")
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	data, err := s.store.ReadSMMReport(ctx, slug, date)
+	if err != nil {
+		if err == store.ErrRunNotFound {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "report not found", "slug": slug, "date": date})
+			return
+		}
+		if strings.HasPrefix(err.Error(), "invalid slug") {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}

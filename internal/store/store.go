@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -2891,4 +2892,207 @@ func (s *Store) SubtasksFromPlan(ctx context.Context, taskID int, agent string, 
 		TaskID: taskID, SpecPath: rel, Phases: out, ParentReopened: parentReopened,
 		DryRun: false,
 	}, nil
+}
+
+// ---------------------------------------------------------------------------
+// SMM async trigger API (#1391) — on-demand SMM without SSM
+// ---------------------------------------------------------------------------
+
+// smmRunsDir is where per-run state files live. Wrapper script writes
+// state transitions here; GET /smm/runs/{id} reads them. deploy:deploy
+// owned (operator ran `mkdir + chown` once at deploy time).
+const smmRunsDir = "/opt/apps/ax/runs"
+
+// smmWrapperScript is the wrapper deployed with the ax/ tree via git.
+// backlog-server forks it via exec.Command; the wrapper flips state file
+// queued→running before smm-daily-monitor.sh and running→done|failed after.
+const smmWrapperScript = "/opt/apps/ax/scripts/smm-run.sh"
+
+// smmReportsRoot is where smm-daily-monitor.sh drops per-client reports.
+// Mirrors backend/smm/insights.py --output convention.
+const smmReportsRoot = "/opt/apps/ax/output/smm/clients"
+
+// SMMRunState is the JSON shape the wrapper script writes and GET /smm/runs
+// reads. Only the wrapper writes; the server only reads.
+type SMMRunState struct {
+	RunID      string `json:"run_id"`
+	Job        string `json:"job"`
+	Status     string `json:"status"` // queued|running|done|failed
+	StartedAt  string `json:"started_at,omitempty"`
+	FinishedAt string `json:"finished_at,omitempty"`
+	ExitCode   *int   `json:"exit_code,omitempty"`
+	PID        int    `json:"pid,omitempty"`
+	Agent      string `json:"agent,omitempty"`
+	LogTail    string `json:"log_tail,omitempty"` // populated by GET handler, not stored
+	ReportURL  string `json:"report_url,omitempty"`
+}
+
+// TriggerSMMResult is what /smm/trigger returns to clients.
+type TriggerSMMResult struct {
+	RunID  string `json:"run_id"`
+	Job    string `json:"job"`
+	Status string `json:"status"`
+}
+
+// TriggerSMM starts a background SMM pipeline run:
+//  1. Assigns a run_id (timestamp + random suffix).
+//  2. Writes state file /opt/apps/ax/runs/<id>.json with status=queued.
+//  3. Forks smm-run.sh <run_id> <job> <agent> via setsid so it survives the
+//     server restarting. Wrapper mutates the state file through the run.
+//
+// job = "pipeline" (full 5-step smm-daily-monitor.sh — MVP scope). "content_agent"
+// (step-5-only) can be added later without protocol change.
+//
+// agent is recorded in the state file for audit; matches AX_AGENT of the caller.
+func (s *Store) TriggerSMM(ctx context.Context, job, agent string) (TriggerSMMResult, error) {
+	if job == "" {
+		job = "pipeline"
+	}
+	if job != "pipeline" {
+		return TriggerSMMResult{}, fmt.Errorf("job must be 'pipeline' (MVP scope; other jobs deferred)")
+	}
+	if agent == "" {
+		agent = "unknown"
+	}
+	// Ensure runs dir exists (idempotent — operator should have chown'd it
+	// once at deploy).
+	if err := os.MkdirAll(smmRunsDir, 0o755); err != nil {
+		return TriggerSMMResult{}, fmt.Errorf("mkdir runs: %w", err)
+	}
+	// run_id = YYYYMMDDTHHMMSSZ-<8hex>. Sortable, human-readable, unique.
+	runID := time.Now().UTC().Format("20060102T150405Z") + "-" + randomHex8()
+
+	// Seed queued state so GET /smm/runs/<id> works immediately even if the
+	// wrapper hasn't started writing yet.
+	initial := SMMRunState{
+		RunID: runID, Job: job, Status: "queued", Agent: agent,
+	}
+	seedBytes, _ := json.MarshalIndent(initial, "", "  ")
+	statePath := filepath.Join(smmRunsDir, runID+".json")
+	if err := os.WriteFile(statePath, seedBytes, 0o644); err != nil {
+		return TriggerSMMResult{}, fmt.Errorf("write state file: %w", err)
+	}
+
+	// Spawn wrapper. setsid + Detached so it survives backlog-server restart.
+	// Nohup-style: stdout/stderr redirected to per-run log inside runs dir.
+	logPath := filepath.Join(smmRunsDir, runID+".log")
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		return TriggerSMMResult{}, fmt.Errorf("create log file: %w", err)
+	}
+	cmd := exec.Command(smmWrapperScript, runID, job, agent)
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	// We don't Wait — fire and forget. wrapper writes state file transitions.
+	if err := cmd.Start(); err != nil {
+		logFile.Close()
+		return TriggerSMMResult{}, fmt.Errorf("start wrapper: %w", err)
+	}
+	// After Start, we can safely close our copy of the log file — the child
+	// inherited its own fd via cmd.Stdout/Stderr.
+	logFile.Close()
+
+	// Update seed with PID so GET can watchdog dead processes.
+	initial.PID = cmd.Process.Pid
+	seedBytes, _ = json.MarshalIndent(initial, "", "  ")
+	_ = os.WriteFile(statePath, seedBytes, 0o644)
+
+	// Detach the process from Go's tracked children — otherwise it becomes a
+	// zombie when done and the server keeps a file descriptor for the pipe.
+	// The wrapper writes exit_code to the state file; we don't need reap.
+	go func() { _ = cmd.Wait() }()
+
+	return TriggerSMMResult{RunID: runID, Job: job, Status: "queued"}, nil
+}
+
+// GetSMMRun reads /opt/apps/ax/runs/<id>.json + tails the log.
+//
+// Watchdog: if state is "running" but the PID is dead, mark as failed with
+// exit_code=-1 (fixes zombie state after a wrapper crash the state file didn't
+// catch). We rewrite the file so subsequent polls see stable state.
+func (s *Store) GetSMMRun(ctx context.Context, runID string) (SMMRunState, error) {
+	statePath := filepath.Join(smmRunsDir, runID+".json")
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return SMMRunState{}, ErrRunNotFound
+		}
+		return SMMRunState{}, fmt.Errorf("read state: %w", err)
+	}
+	var st SMMRunState
+	if err := json.Unmarshal(data, &st); err != nil {
+		return SMMRunState{}, fmt.Errorf("parse state: %w", err)
+	}
+	// Watchdog running→failed if PID is gone. kill -0 returns nil if alive.
+	if st.Status == "running" && st.PID > 0 {
+		if err := syscall.Kill(st.PID, 0); err != nil {
+			// Process gone. Mark failed. Callers see stable status next poll.
+			exitCode := -1
+			st.Status = "failed"
+			st.ExitCode = &exitCode
+			if st.FinishedAt == "" {
+				st.FinishedAt = time.Now().UTC().Format(time.RFC3339)
+			}
+			out, _ := json.MarshalIndent(st, "", "  ")
+			_ = os.WriteFile(statePath, out, 0o644)
+		}
+	}
+	// Populate log tail — last ~50 lines of the run log.
+	logPath := filepath.Join(smmRunsDir, runID+".log")
+	if logData, err := os.ReadFile(logPath); err == nil {
+		st.LogTail = tailLines(string(logData), 50)
+	}
+	return st, nil
+}
+
+// ReadSMMReport serves output/smm/clients/<slug>/reports/<date>.json.
+// Returns ErrRunNotFound if the file doesn't exist (client uses 404).
+func (s *Store) ReadSMMReport(ctx context.Context, slug, date string) ([]byte, error) {
+	// Basic sanitisation — path components must not contain ../
+	if strings.Contains(slug, "..") || strings.Contains(slug, "/") ||
+		strings.Contains(date, "..") || strings.Contains(date, "/") {
+		return nil, fmt.Errorf("invalid slug or date")
+	}
+	full := filepath.Join(smmReportsRoot, slug, "reports", date+".json")
+	data, err := os.ReadFile(full)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, ErrRunNotFound
+		}
+		return nil, fmt.Errorf("read report: %w", err)
+	}
+	return data, nil
+}
+
+// ErrRunNotFound signals a missing run state file or missing report — client
+// translates to 404.
+var ErrRunNotFound = errors.New("smm run or report not found")
+
+// randomHex8 returns 8 lowercase hex characters, used as run_id suffix.
+// Not cryptographic; sync.Once seeding is fine.
+func randomHex8() string {
+	const hex = "0123456789abcdef"
+	// crypto/rand is overkill for run_id disambiguation; time.Now nanos +
+	// a tiny mix is plenty of entropy for concurrent triggers.
+	n := time.Now().UnixNano()
+	out := make([]byte, 8)
+	for i := 0; i < 8; i++ {
+		out[i] = hex[n&0xf]
+		n >>= 4
+	}
+	return string(out)
+}
+
+// tailLines returns the last n lines of s. Cheap enough for the ~50-line tail
+// the /smm/runs handler wants.
+func tailLines(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) <= n {
+		return s
+	}
+	return strings.Join(lines[len(lines)-n:], "\n")
 }
