@@ -3882,6 +3882,146 @@ func (s *Store) CloseSprint(ctx context.Context, id int) (SprintCloseResult, err
 	return SprintCloseResult{SprintID: id, Status: "CLOSED", ClosedAt: closedAt}, nil
 }
 
+// AgentEntry is one row of GET /agent/list.
+type AgentEntry struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	FilePath    string `json:"file_path"`
+	Role        string `json:"role"`
+}
+
+// agentsDirRoot is where /opt/apps/ax hosts the discovered agent .md files.
+// Mirrors Python PROJECT_ROOT / ".claude" / "agents" (backlogist/core/agents.py).
+const agentsDirRoot = "/opt/apps/ax/.claude/agents"
+
+// ListAgents scans the server-side .claude/agents/ directory, parses the YAML
+// frontmatter of each .md file, and returns a sorted slice matching Python
+// discover_agent_files. Malformed frontmatter → skipped with a log line.
+// Missing directory → empty slice + nil error (parity with Python).
+func (s *Store) ListAgents(ctx context.Context) ([]AgentEntry, error) {
+	entries, err := os.ReadDir(agentsDirRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []AgentEntry{}, nil
+		}
+		return nil, fmt.Errorf("read agents dir: %w", err)
+	}
+
+	out := make([]AgentEntry, 0, len(entries))
+	for _, de := range entries {
+		if de.IsDir() {
+			continue
+		}
+		name := de.Name()
+		if filepath.Ext(name) != ".md" {
+			continue
+		}
+		full := filepath.Join(agentsDirRoot, name)
+		data, err := os.ReadFile(full)
+		if err != nil {
+			log.Printf("agent list: skip %s: read: %v", name, err)
+			continue
+		}
+		text := string(data)
+		fm, ok := parseAgentFrontmatter(text)
+		if !ok {
+			log.Printf("agent list: skip %s: no valid frontmatter", name)
+			continue
+		}
+		stem := strings.TrimSuffix(name, ".md")
+		display := fm["name"]
+		if display == "" {
+			display = stem
+		}
+		out = append(out, AgentEntry{
+			Name:        display,
+			Description: fm["description"],
+			FilePath:    full,
+			Role:        extractAgentRole(text),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+// parseAgentFrontmatter reads a `---\nkey: value\n---` block at the top of a
+// markdown file. Returns the parsed key-value map + true; nil map + false when
+// no valid frontmatter is present.
+func parseAgentFrontmatter(text string) (map[string]string, bool) {
+	lines := strings.Split(text, "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) != "---" {
+		return nil, false
+	}
+	endIdx := -1
+	for i := 1; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) == "---" {
+			endIdx = i
+			break
+		}
+	}
+	if endIdx < 0 {
+		return nil, false
+	}
+	out := map[string]string{}
+	for _, line := range lines[1:endIdx] {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		colon := strings.Index(line, ":")
+		if colon < 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:colon])
+		val := strings.TrimSpace(line[colon+1:])
+		if key != "" {
+			out[key] = val
+		}
+	}
+	return out, true
+}
+
+// extractAgentRole finds `## Role` and returns the first non-empty non-header
+// line after it; falls back to the first `# ` header after frontmatter.
+// Empty string when nothing matches (parity with Python _extract_role).
+func extractAgentRole(text string) string {
+	lines := strings.Split(text, "\n")
+	// Skip frontmatter block if any.
+	start := 0
+	inFm := false
+	for i, line := range lines {
+		if i == 0 && strings.TrimSpace(line) == "---" {
+			inFm = true
+			continue
+		}
+		if inFm && strings.TrimSpace(line) == "---" {
+			start = i + 1
+			break
+		}
+	}
+	// Look for ## Role header.
+	for i := start; i < len(lines); i++ {
+		s := strings.ToLower(strings.TrimSpace(lines[i]))
+		if strings.HasPrefix(s, "## role") {
+			for j := i + 1; j < len(lines) && j < i+5; j++ {
+				c := strings.TrimSpace(lines[j])
+				if c != "" && !strings.HasPrefix(c, "#") {
+					return c
+				}
+			}
+			break
+		}
+	}
+	// Fallback: first `# ` header after frontmatter.
+	for i := start; i < len(lines); i++ {
+		s := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(s, "# ") && !strings.HasPrefix(s, "##") {
+			return strings.TrimSpace(strings.TrimPrefix(s, "# "))
+		}
+	}
+	return ""
+}
+
 // AddSprintTasks appends task IDs to an existing sprint. Missing tasks and
 // already-present pairs come back under skipped_tasks.
 func (s *Store) AddSprintTasks(ctx context.Context, sprintID int, taskIDs []int) (SprintAddResult, error) {

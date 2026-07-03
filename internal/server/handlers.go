@@ -1145,6 +1145,26 @@ func (s *Server) handleSprintClose(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+// handleAgentList — GET /agent/list (#1437).
+//
+// Reads /opt/apps/ax/.claude/agents/*.md server-side, parses YAML frontmatter
+// and the `## Role` header per file. Missing dir → 200 {agents:[], count:0}
+// (parity with Python discover_agent_files behaviour). Malformed frontmatter
+// files are skipped with a log line.
+//
+// The response is stable across calls; --format wallets falls through to /exec
+// (TON wallets path is Python-only, unchanged).
+func (s *Server) handleAgentList(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	res, err := s.store.ListAgents(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"agents": res, "count": len(res)})
+}
+
 // handleSprintAdd — POST /sprint/{id}/add (#1438).
 //
 // Body: {task_ids:[]int}. Appends tasks to an existing sprint (any status).

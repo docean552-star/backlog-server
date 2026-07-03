@@ -61,6 +61,7 @@ func New(cfg config.Config, st *store.Store) *Server {
 	r.Get("/sprint/{id}", s.handleSprintGet)
 	r.Post("/sprint/{id}/close", s.handleSprintClose)
 	r.Post("/sprint/{id}/add", s.handleSprintAdd)
+	r.Get("/agent/list", s.handleAgentList)
 	r.Post("/knowledge", s.handleKnowledge)
 	r.Patch("/task/{id}", s.handleUpdate)
 	r.Post("/exec", s.handleExec)
