@@ -2948,8 +2948,8 @@ func (s *Store) TriggerSMM(ctx context.Context, job, agent string) (TriggerSMMRe
 	if job == "" {
 		job = "pipeline"
 	}
-	if job != "pipeline" {
-		return TriggerSMMResult{}, fmt.Errorf("job must be 'pipeline' (MVP scope; other jobs deferred)")
+	if job != "pipeline" && job != "noop" {
+		return TriggerSMMResult{}, fmt.Errorf("job must be 'pipeline' or 'noop' (MVP scope; other jobs deferred)")
 	}
 	if agent == "" {
 		agent = "unknown"
