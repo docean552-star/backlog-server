@@ -728,3 +728,57 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	setCache(w, hit)
 	writeJSON(w, http.StatusOK, counts)
 }
+
+// handleMerge — POST /task/{id}/merge. Body: {absorbed_id, agent, dry_run?}.
+//
+// Absorbs task B (absorbed_id) into task A (path id):
+//   - union of list fields on A; done_when items from B tagged "(from #B) "
+//   - tasks blocked_by B → replaced with A (dedup)
+//   - B.status = SUPERSEDED, note = "Merged into #A"
+//   - audit_trail per changed field on A + one for B's status change
+//
+// 400: malformed body / missing absorbed_id / missing agent.
+// 404: A or B not found.
+// 422: SAME_TASK / TARGET_TERMINAL / ABSORBED_TERMINAL.
+// 200: success + { task_a, fields_updated, redirected_dep_ids, b_status, dry_run }.
+func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id must be integer"})
+		return
+	}
+	var req struct {
+		AbsorbedID int    `json:"absorbed_id"`
+		Agent      string `json:"agent"`
+		DryRun     bool   `json:"dry_run"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+		return
+	}
+	req.Agent = strings.TrimSpace(req.Agent)
+	if req.Agent == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "agent required"})
+		return
+	}
+	if req.AbsorbedID <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "absorbed_id required (positive integer)"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	res, err := s.store.MergeTasks(ctx, id, req.AbsorbedID, req.Agent, req.DryRun)
+	if err != nil {
+		if store.IsNotFound(err) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "task not found"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if len(res.Failures) > 0 {
+		writeJSON(w, http.StatusUnprocessableEntity, res)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}

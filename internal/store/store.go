@@ -2101,3 +2101,432 @@ func (s *Store) ReleaseTask(ctx context.Context, taskID int, agent string) (Adva
 	}
 	return AdvanceResult{Task: updated, FromStatus: from, ToStatus: "READY"}, nil
 }
+
+// ---------------------------------------------------------------------------
+// Merge: absorb task B into task A
+// ---------------------------------------------------------------------------
+
+// mergeTerminalStatuses: statuses from which neither side of a merge is allowed.
+// Mirrors backlogist/core/commands.py::cmd_merge — CANCELLED and SUPERSEDED are
+// the only rejections; DONE is permitted (Python parity, see test_merge.py).
+var mergeTerminalStatuses = map[string]bool{
+	"CANCELLED":  true,
+	"SUPERSEDED": true,
+}
+
+// MergeResult mirrors the shape returned by cmd_merge in Python: the union'd
+// A, the fields that actually changed, the redirected dependents, and B's
+// terminal status. Failures[] used for 422 gate failures (terminal status,
+// self-merge). dry_run flag echoed back for client display.
+type MergeResult struct {
+	TaskA             Task                 `json:"task_a"`
+	AbsorbedID        int                  `json:"absorbed_id"`
+	FieldsUpdated     []string             `json:"fields_updated"`
+	RedirectedDepIDs  []int                `json:"redirected_dep_ids"`
+	BStatus           string               `json:"b_status"`
+	DryRun            bool                 `json:"dry_run"`
+	Failures          []AdvanceGateFailure `json:"failures,omitempty"`
+}
+
+// MergeTasks absorbs task B (absorbedID) into task A (absorberID):
+//   - union of list fields (blocked_by/consumers/done_when/references/tags) onto A
+//   - done_when items from B get "(from #B) " prefix (provenance preservation)
+//   - note appended if B has one
+//   - dependents of B (T.blocked_by contains B) get B replaced with A
+//   - B.status = SUPERSEDED, B.note = "Merged into #A"
+//   - audit_trail entries per changed field + B status change
+//
+// All writes in one transaction. dryRun computes the diff without persisting.
+//
+// Consumers and tags are TEXT-json columns not exposed on the Task struct; we
+// touch them via raw SQL SELECT/UPDATE inside the tx to avoid a struct churn
+// PR that would ripple through every read endpoint.
+//
+// Not ported from Python cmd_merge:
+//   - export_yaml() — native callers work through HTTP; local yaml is a Python
+//     CLI convenience not needed here.
+//   - stdout progress lines ("  blocked_by: added [...]", etc.) — the JSON
+//     result captures the same information in structured form.
+func (s *Store) MergeTasks(ctx context.Context, absorberID, absorbedID int, agent string, dryRun bool) (MergeResult, error) {
+	if absorberID == absorbedID {
+		return MergeResult{
+			AbsorbedID: absorbedID,
+			Failures: []AdvanceGateFailure{{
+				Check:  "SAME_TASK",
+				Detail: fmt.Sprintf("cannot merge task into itself (#%d)", absorberID),
+			}},
+		}, nil
+	}
+	taskA, _, err := s.GetTask(ctx, absorberID)
+	if err != nil {
+		return MergeResult{}, err
+	}
+	taskB, _, err := s.GetTask(ctx, absorbedID)
+	if err != nil {
+		return MergeResult{}, err
+	}
+	fromA := strings.ToUpper(strings.TrimSpace(taskA.Status))
+	fromB := strings.ToUpper(strings.TrimSpace(taskB.Status))
+	if mergeTerminalStatuses[fromA] {
+		return MergeResult{
+			TaskA: taskA, AbsorbedID: absorbedID, DryRun: dryRun,
+			Failures: []AdvanceGateFailure{{
+				Check:  "TARGET_TERMINAL",
+				Detail: fmt.Sprintf("cannot merge into #%d: status is %s", absorberID, fromA),
+			}},
+		}, nil
+	}
+	if mergeTerminalStatuses[fromB] {
+		return MergeResult{
+			TaskA: taskA, AbsorbedID: absorbedID, DryRun: dryRun,
+			Failures: []AdvanceGateFailure{{
+				Check:  "ABSORBED_TERMINAL",
+				Detail: fmt.Sprintf("task #%d is already %s, cannot merge", absorbedID, fromB),
+			}},
+		}, nil
+	}
+
+	// Fetch consumers + tags via raw SQL (not on the Task struct).
+	var aConsumersJSON, aTagsJSON, bConsumersJSON, bTagsJSON string
+	if err := s.pool.QueryRow(ctx,
+		`SELECT consumers, tags FROM tasks WHERE id = $1`, absorberID,
+	).Scan(&aConsumersJSON, &aTagsJSON); err != nil {
+		return MergeResult{}, fmt.Errorf("load A consumers/tags: %w", err)
+	}
+	if err := s.pool.QueryRow(ctx,
+		`SELECT consumers, tags FROM tasks WHERE id = $1`, absorbedID,
+	).Scan(&bConsumersJSON, &bTagsJSON); err != nil {
+		return MergeResult{}, fmt.Errorf("load B consumers/tags: %w", err)
+	}
+	aConsumers := parseStringArray(aConsumersJSON)
+	bConsumers := parseStringArray(bConsumersJSON)
+	aTags := parseStringArray(aTagsJSON)
+	bTags := parseStringArray(bTagsJSON)
+
+	// --- Compute unions ---
+	changedFields := []string{}
+	// blocked_by: sorted set union minus A's own id (no self-block)
+	newBlockedBy := mergeIntSetSortedExclude(taskA.BlockedBy, taskB.BlockedBy, absorberID)
+	blockedChanged := !intSliceEq(newBlockedBy, taskA.BlockedBy)
+	if blockedChanged {
+		changedFields = append(changedFields, "blocked_by")
+	}
+	// consumers: sorted set union
+	newConsumers := mergeStringSetSorted(aConsumers, bConsumers)
+	consumersChanged := !stringSliceEq(newConsumers, aConsumers)
+	if consumersChanged {
+		changedFields = append(changedFields, "consumers")
+	}
+	// done_when: append B items with (from #N) prefix if new
+	prefix := fmt.Sprintf("(from #%d) ", absorbedID)
+	newDoneWhen := append([]string{}, taskA.DoneWhen...)
+	aDoneSet := map[string]bool{}
+	for _, v := range taskA.DoneWhen {
+		aDoneSet[v] = true
+	}
+	for _, v := range taskB.DoneWhen {
+		tagged := prefix + v
+		if !aDoneSet[tagged] {
+			newDoneWhen = append(newDoneWhen, tagged)
+			aDoneSet[tagged] = true
+		}
+	}
+	doneChanged := len(newDoneWhen) != len(taskA.DoneWhen)
+	if doneChanged {
+		changedFields = append(changedFields, "done_when")
+	}
+	// references: preserve A order, append B references not in A
+	newReferences := append([]string{}, taskA.References...)
+	aRefSet := map[string]bool{}
+	for _, v := range taskA.References {
+		aRefSet[v] = true
+	}
+	for _, v := range taskB.References {
+		if !aRefSet[v] {
+			newReferences = append(newReferences, v)
+			aRefSet[v] = true
+		}
+	}
+	refsChanged := len(newReferences) != len(taskA.References)
+	if refsChanged {
+		changedFields = append(changedFields, "references")
+	}
+	// tags: sorted set union
+	newTags := mergeStringSetSorted(aTags, bTags)
+	tagsChanged := !stringSliceEq(newTags, aTags)
+	if tagsChanged {
+		changedFields = append(changedFields, "tags")
+	}
+	// note: append B.note to A.note with \n separator if both present
+	newNote := taskA.Note
+	if taskB.Note != "" {
+		sep := ""
+		if taskA.Note != "" {
+			sep = "\n"
+		}
+		newNote = taskA.Note + sep + taskB.Note
+	}
+	noteChanged := newNote != taskA.Note
+	if noteChanged {
+		changedFields = append(changedFields, "note")
+	}
+
+	// --- Find dependents of B (T.blocked_by contains absorbedID) ---
+	depRows, err := s.pool.Query(ctx,
+		`SELECT id, blocked_by
+		   FROM tasks
+		  WHERE blocked_by::jsonb @> jsonb_build_array($1::int)
+		    AND id != $2`,
+		absorbedID, absorbedID,
+	)
+	if err != nil {
+		return MergeResult{}, fmt.Errorf("find dependents: %w", err)
+	}
+	type depRow struct {
+		ID           int
+		BlockedByOld []int
+		BlockedByNew []int
+	}
+	var deps []depRow
+	for depRows.Next() {
+		var id int
+		var bbJSON string
+		if err := depRows.Scan(&id, &bbJSON); err != nil {
+			depRows.Close()
+			return MergeResult{}, fmt.Errorf("scan dep: %w", err)
+		}
+		if id == absorberID {
+			continue // A is not redirected into itself; skip
+		}
+		old := parseIntArray(bbJSON)
+		// Replace absorbedID with absorberID, then dedup preserving first-seen order.
+		seen := map[int]bool{}
+		newBB := []int{}
+		for _, v := range old {
+			target := v
+			if v == absorbedID {
+				target = absorberID
+			}
+			if !seen[target] {
+				seen[target] = true
+				newBB = append(newBB, target)
+			}
+		}
+		deps = append(deps, depRow{ID: id, BlockedByOld: old, BlockedByNew: newBB})
+	}
+	depRows.Close()
+	if err := depRows.Err(); err != nil {
+		return MergeResult{}, fmt.Errorf("iter dependents: %w", err)
+	}
+
+	redirected := make([]int, 0, len(deps))
+	for _, d := range deps {
+		redirected = append(redirected, d.ID)
+	}
+
+	if dryRun {
+		return MergeResult{
+			TaskA: taskA, AbsorbedID: absorbedID,
+			FieldsUpdated:    changedFields,
+			RedirectedDepIDs: redirected,
+			BStatus:          fromB, // unchanged in dry-run
+			DryRun:           true,
+		}, nil
+	}
+
+	// --- Transaction: A UPDATE + N deps UPDATE + B UPDATE + audits ---
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return MergeResult{}, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// UPDATE A with union'd fields (all in one statement).
+	newBlockedByJSON := toJSONArrayInts(newBlockedBy)
+	newConsumersJSON := toJSONArrayStrings(newConsumers)
+	newDoneWhenJSON := toJSONArrayStrings(newDoneWhen)
+	newReferencesJSON := toJSONArrayStrings(newReferences)
+	newTagsJSON := toJSONArrayStrings(newTags)
+	if _, err := tx.Exec(ctx,
+		`UPDATE tasks
+		    SET blocked_by = $1,
+		        consumers  = $2,
+		        done_when  = $3,
+		        "references" = $4,
+		        tags       = $5,
+		        note       = $6,
+		        updated_at = NOW()::text
+		  WHERE id = $7`,
+		newBlockedByJSON, newConsumersJSON, newDoneWhenJSON,
+		newReferencesJSON, newTagsJSON, newNote, absorberID,
+	); err != nil {
+		return MergeResult{}, fmt.Errorf("update A: %w", err)
+	}
+
+	// audit_trail per changed field on A. command="merge" for grep-ability.
+	for _, field := range changedFields {
+		var oldVal, newVal string
+		switch field {
+		case "blocked_by":
+			oldVal = fmt.Sprintf("%v", taskA.BlockedBy)
+			newVal = fmt.Sprintf("%v", newBlockedBy)
+		case "consumers":
+			oldVal = fmt.Sprintf("%v", aConsumers)
+			newVal = fmt.Sprintf("%v", newConsumers)
+		case "done_when":
+			oldVal = fmt.Sprintf("%v", taskA.DoneWhen)
+			newVal = fmt.Sprintf("%v", newDoneWhen)
+		case "references":
+			oldVal = fmt.Sprintf("%v", taskA.References)
+			newVal = fmt.Sprintf("%v", newReferences)
+		case "tags":
+			oldVal = fmt.Sprintf("%v", aTags)
+			newVal = fmt.Sprintf("%v", newTags)
+		case "note":
+			oldVal = taskA.Note
+			newVal = newNote
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO audit_trail (task_id, agent, field_changed, old_value, new_value, command, timestamp)
+			 VALUES ($1, $2, $3, $4, $5, 'merge', NOW()::text)`,
+			absorberID, agent, field, oldVal, newVal,
+		); err != nil {
+			return MergeResult{}, fmt.Errorf("audit A %s: %w", field, err)
+		}
+	}
+
+	// UPDATE each dependent's blocked_by + audit.
+	for _, d := range deps {
+		newBBJSON := toJSONArrayInts(d.BlockedByNew)
+		if _, err := tx.Exec(ctx,
+			`UPDATE tasks SET blocked_by = $1, updated_at = NOW()::text WHERE id = $2`,
+			newBBJSON, d.ID,
+		); err != nil {
+			return MergeResult{}, fmt.Errorf("update dep %d: %w", d.ID, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO audit_trail (task_id, agent, field_changed, old_value, new_value, command, timestamp)
+			 VALUES ($1, $2, 'blocked_by', $3, $4, 'merge', NOW()::text)`,
+			d.ID, agent, fmt.Sprintf("%v", d.BlockedByOld), fmt.Sprintf("%v", d.BlockedByNew),
+		); err != nil {
+			return MergeResult{}, fmt.Errorf("audit dep %d: %w", d.ID, err)
+		}
+	}
+
+	// UPDATE B → SUPERSEDED + note + audit.
+	bNote := fmt.Sprintf("Merged into #%d", absorberID)
+	if _, err := tx.Exec(ctx,
+		`UPDATE tasks SET status = 'SUPERSEDED', note = $1, updated_at = NOW()::text WHERE id = $2`,
+		bNote, absorbedID,
+	); err != nil {
+		return MergeResult{}, fmt.Errorf("update B: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO audit_trail (task_id, agent, field_changed, old_value, new_value, command, timestamp)
+		 VALUES ($1, $2, 'status', $3, 'SUPERSEDED', $4, NOW()::text)`,
+		absorbedID, agent, fromB, fmt.Sprintf("merge into #%d", absorberID),
+	); err != nil {
+		return MergeResult{}, fmt.Errorf("audit B: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return MergeResult{}, fmt.Errorf("commit: %w", err)
+	}
+	if s.cache != nil {
+		s.cache.Bump()
+	}
+	// Refresh A via GetTask (mirrors samvel-32 fix: avoid in-memory drift of
+	// updated_at/status/note in the returned struct — DB is truth after commit).
+	refreshed, _, err := s.GetTask(ctx, absorberID)
+	if err != nil {
+		refreshed = taskA
+		refreshed.BlockedBy = newBlockedBy
+		refreshed.DoneWhen = newDoneWhen
+		refreshed.References = newReferences
+		refreshed.Note = newNote
+	}
+	return MergeResult{
+		TaskA: refreshed, AbsorbedID: absorbedID,
+		FieldsUpdated:    changedFields,
+		RedirectedDepIDs: redirected,
+		BStatus:          "SUPERSEDED",
+		DryRun:           false,
+	}, nil
+}
+
+// ---------------------------------------------------------------------------
+// Merge helpers (dedup/sort/JSON serialisation)
+// ---------------------------------------------------------------------------
+
+func mergeIntSetSortedExclude(a, b []int, exclude int) []int {
+	set := map[int]bool{}
+	for _, v := range a {
+		set[v] = true
+	}
+	for _, v := range b {
+		set[v] = true
+	}
+	delete(set, exclude)
+	out := make([]int, 0, len(set))
+	for v := range set {
+		out = append(out, v)
+	}
+	sort.Ints(out)
+	return out
+}
+
+func mergeStringSetSorted(a, b []string) []string {
+	set := map[string]bool{}
+	for _, v := range a {
+		set[v] = true
+	}
+	for _, v := range b {
+		set[v] = true
+	}
+	out := make([]string, 0, len(set))
+	for v := range set {
+		out = append(out, v)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func intSliceEq(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i, v := range a {
+		if v != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func stringSliceEq(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i, v := range a {
+		if v != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func toJSONArrayInts(v []int) string {
+	if v == nil {
+		return "[]"
+	}
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
+func toJSONArrayStrings(v []string) string {
+	if v == nil {
+		return "[]"
+	}
+	b, _ := json.Marshal(v)
+	return string(b)
+}
