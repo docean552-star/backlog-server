@@ -829,6 +829,38 @@ func (s *Server) handleMerge(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+// handleParseRecommendations — GET /task/{id}/parse-recommendations.
+//
+// Reads parent's review-result.md, extracts the yaml block, validates
+// mandatory fields, and returns recommendations + ready-to-run
+// `backlogist create` commands. Non-fatal parse failures (missing file,
+// missing section, malformed yaml, per-item missing fields) return 200
+// with errors[] populated — parity with Python's stdout-only reporting.
+//
+// 200: success (recommendations may be empty).
+// 400: id not integer.
+// 404: task not found.
+// 500: DB error / read error other than missing file.
+func (s *Server) handleParseRecommendations(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id must be integer"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	res, err := s.store.ParseRecommendations(ctx, id)
+	if err != nil {
+		if store.IsNotFound(err) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "task not found", "id": id})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
 // handleSMMTrigger — POST /smm/trigger. Body: {job?, agent?}.
 //
 // job defaults to "pipeline" (full 5-step smm-daily-monitor.sh). MVP scope

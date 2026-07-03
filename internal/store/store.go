@@ -18,6 +18,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"gopkg.in/yaml.v3"
 
 	"github.com/docean552-star/backlog-server/internal/cache"
 )
@@ -3110,4 +3111,184 @@ func tailLines(s string, n int) string {
 		return s
 	}
 	return strings.Join(lines[len(lines)-n:], "\n")
+}
+
+// ---------------------------------------------------------------------------
+// ParseRecommendations: read <spec_dir>/review-result.md, extract yaml block,
+// validate mandatory fields, generate ready-to-run backlogist create commands.
+// Native port of ax/backlogist/core/commands.py::cmd_parse_recommendations
+// + backlogist/aggregate/recommendations.py::{parse_recommendations, generate_create_commands}.
+// ---------------------------------------------------------------------------
+
+// Recommendation is one entry in the yaml `follow_up_children` list. Fields
+// mirror Python MANDATORY_FIELDS + optional free_notes; other fields are ignored
+// (permissive parsing — schema evolves without breaking the server).
+type Recommendation struct {
+	Title             string `json:"title" yaml:"title"`
+	Mode              string `json:"mode" yaml:"mode"`
+	Why               string `json:"why" yaml:"why"`
+	BlocksParentDone  bool   `json:"blocks_parent_done" yaml:"blocks_parent_done"`
+	FreeNotes         string `json:"free_notes,omitempty" yaml:"free_notes,omitempty"`
+}
+
+// ParseRecommendationsResult is what the /task/{id}/parse-recommendations
+// handler returns. Errors is a per-recommendation map keyed by "recommendation_N"
+// with a short description; parity with Python's return shape.
+type ParseRecommendationsResult struct {
+	TaskID          int              `json:"task_id"`
+	SpecPath        string           `json:"spec_path"`
+	Recommendations []Recommendation `json:"recommendations"`
+	Commands        []string         `json:"commands"`
+	Errors          map[string]string `json:"errors,omitempty"`
+}
+
+// recommendationsSectionRE matches Python:
+//   re.compile(r"##\s+Recommendations.*?\n```yaml\n(.+?)\n```", re.DOTALL | re.IGNORECASE)
+// Go: (?is) = case-insensitive + dot-matches-newline.
+var recommendationsSectionRE = regexp.MustCompile(
+	`(?is)##\s+Recommendations.*?\n` + "```" + `yaml\n(.+?)\n` + "```")
+
+// ParseRecommendations reads the parent's review-result.md, extracts the
+// yaml block, unmarshals follow_up_children, validates each entry against the
+// mandatory field set, and generates the ready-to-run create commands.
+//
+// Non-fatal cases (200 with errors[] populated):
+//   - review-result.md missing on disk (Errors["file"]).
+//   - no ## Recommendations yaml block in the file (Errors["section"]).
+//   - malformed yaml (Errors["yaml"]).
+//   - individual recommendations missing mandatory fields
+//     (Errors["recommendation_N"]).
+//
+// Spec dir resolution mirrors SubtasksFromPlan: task.TaskPlan's parent, or
+// convention docs/specs/<owner>-<id>/.
+func (s *Store) ParseRecommendations(ctx context.Context, taskID int) (ParseRecommendationsResult, error) {
+	task, _, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		return ParseRecommendationsResult{}, err
+	}
+	// Resolve spec dir. Same fallback chain as SubtasksFromPlan.
+	var specDir string
+	if trimmedPlan := strings.TrimSpace(task.TaskPlan); trimmedPlan != "" {
+		// task.TaskPlan points at task_plan.md; sibling review-result.md lives
+		// in the same dir.
+		specDir = filepath.Dir(trimmedPlan)
+	} else {
+		owner := strings.ToLower(strings.TrimSpace(task.Owner))
+		if owner == "" {
+			return ParseRecommendationsResult{
+				TaskID: taskID,
+				Errors: map[string]string{
+					"spec_dir": "task has no task_plan and no owner for convention fallback",
+				},
+			}, nil
+		}
+		specDir = fmt.Sprintf("docs/specs/%s-%d", owner, taskID)
+	}
+	rel := filepath.Join(specDir, "review-result.md")
+
+	// Best-effort git pull before file read — same pattern as SubtasksFromPlan.
+	pullCtx, cancelPull := context.WithTimeout(ctx, 5*time.Second)
+	pull := exec.CommandContext(pullCtx, "git", "-C", axFSRoot,
+		"pull", "--rebase", "--autostash", "origin", "main")
+	pull.Env = os.Environ()
+	if out, err := pull.CombinedOutput(); err != nil {
+		log.Printf("git pull %s failed (continuing): %s: %v",
+			axFSRoot, bytes.TrimSpace(out), err)
+	}
+	cancelPull()
+
+	full := filepath.Join(axFSRoot, rel)
+	content, err := os.ReadFile(full)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return ParseRecommendationsResult{
+				TaskID:   taskID,
+				SpecPath: rel,
+				Errors:   map[string]string{"file": "review-result.md not found"},
+			}, nil
+		}
+		return ParseRecommendationsResult{}, fmt.Errorf("read review-result: %w", err)
+	}
+
+	m := recommendationsSectionRE.FindSubmatch(content)
+	if m == nil {
+		return ParseRecommendationsResult{
+			TaskID:   taskID,
+			SpecPath: rel,
+			Errors:   map[string]string{"section": "no ## Recommendations yaml block found"},
+		}, nil
+	}
+	yamlBlock := m[1]
+
+	// Yaml shape: { follow_up_children: [...], ... }
+	var parsed struct {
+		FollowUpChildren []Recommendation `yaml:"follow_up_children"`
+	}
+	if err := yaml.Unmarshal(yamlBlock, &parsed); err != nil {
+		return ParseRecommendationsResult{
+			TaskID:   taskID,
+			SpecPath: rel,
+			Errors:   map[string]string{"yaml": "yaml parse: " + err.Error()},
+		}, nil
+	}
+
+	recs := parsed.FollowUpChildren
+	errorsMap := map[string]string{}
+
+	// Also validate against the raw yaml so a missing field is caught even
+	// though yaml.v3 zero-values it silently. Re-parse as a generic map list.
+	var rawList []map[string]any
+	if err := yaml.Unmarshal(yamlBlock, &struct {
+		FollowUpChildren *[]map[string]any `yaml:"follow_up_children"`
+	}{FollowUpChildren: &rawList}); err == nil {
+		mandatory := []string{"title", "mode", "why", "blocks_parent_done"}
+		for i, raw := range rawList {
+			var missing []string
+			for _, f := range mandatory {
+				if _, ok := raw[f]; !ok {
+					missing = append(missing, f)
+				}
+			}
+			if len(missing) > 0 {
+				errorsMap[fmt.Sprintf("recommendation_%d", i)] =
+					"missing fields: [" + strings.Join(missing, ", ") + "]"
+			}
+		}
+	}
+
+	// Generate create commands. Empty when no recommendations or when
+	// validation errors — client sees errors and skips commands.
+	var commands []string
+	if len(errorsMap) == 0 {
+		commands = make([]string, 0, len(recs))
+		for _, r := range recs {
+			title := strings.ReplaceAll(r.Title, `"`, `\"`)
+			why := strings.ReplaceAll(r.Why, `"`, `\"`)
+			bv := r.FreeNotes
+			if bv == "" {
+				bv = fmt.Sprintf("see parent #%d aggregate review recommendation", taskID)
+			}
+			bv = strings.ReplaceAll(bv, `"`, `\"`)
+			commands = append(commands,
+				fmt.Sprintf(`backlogist create title:"%s" owner:?? mode:%s why:"%s" business_value:"%s" --parent '#%d'`,
+					title, r.Mode, why, bv, taskID))
+		}
+	}
+
+	return ParseRecommendationsResult{
+		TaskID:          taskID,
+		SpecPath:        rel,
+		Recommendations: recs,
+		Commands:        commands,
+		Errors:          nilIfEmpty(errorsMap),
+	}, nil
+}
+
+// nilIfEmpty returns nil for empty maps so the JSON encoder omits the errors
+// field entirely instead of returning "errors": {}.
+func nilIfEmpty(m map[string]string) map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+	return m
 }
