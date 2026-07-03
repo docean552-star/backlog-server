@@ -51,6 +51,7 @@ func New(cfg config.Config, st *store.Store) *Server {
 	r.Post("/task/{id}/merge", s.handleMerge)
 	r.Post("/task/{id}/subtasks-from-plan", s.handleSubtasksFromPlan)
 	r.Get("/task/{id}/parse-recommendations", s.handleParseRecommendations)
+	r.Post("/task/{id}/aggregate-review", s.handleAggregateReview)
 	r.Post("/smm/trigger", s.handleSMMTrigger)
 	r.Get("/smm/runs/{id}", s.handleSMMGetRun)
 	r.Get("/smm/reports/{slug}/{date}", s.handleSMMGetReport)

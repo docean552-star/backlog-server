@@ -959,6 +959,54 @@ func (s *Server) handleSMMGetReport(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
+// handleAggregateReview — POST /task/{id}/aggregate-review (#1392).
+//
+// Body: {agent, force?, dry_run?}. Runs the server-portable slice of Python
+// cmd_aggregate_review: verify parent (has_child), load workflow config,
+// aggregate children cost/count, and either auto-record PASS verdict (trivial
+// cluster) or hand back check-names for the client to run locally.
+//
+// 200 skipped=true:  server wrote paired audit_trail + review_results rows;
+//                    sync_aggregate_on_verdict_trigger fired -> aggregate_state
+//                    -> passed. Client just prints the auto-skip message.
+// 200 skipped=false: non-trivial cluster / --force / --dry-run — client continues
+//                    with local cheap_checks + evidence + LLM prompt.
+// 400: agent missing / invalid JSON / bad id.
+// 404: task not found.
+func (s *Server) handleAggregateReview(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id must be integer"})
+		return
+	}
+	var req struct {
+		Agent  string `json:"agent"`
+		Force  bool   `json:"force"`
+		DryRun bool   `json:"dry_run"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+		return
+	}
+	req.Agent = strings.TrimSpace(req.Agent)
+	if req.Agent == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "agent required"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	res, err := s.store.BeginAggregateReview(ctx, id, req.Agent, req.Force, req.DryRun)
+	if err != nil {
+		if store.IsNotFound(err) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "task not found", "id": id})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
 // handleSessionClose — POST /session/close (#1390).
 //
 // Body: {agent, session_label, done_ids[]}. Writes one audit_trail row per

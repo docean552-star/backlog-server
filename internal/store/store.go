@@ -3325,6 +3325,234 @@ func nilIfEmpty(m map[string]string) map[string]string {
 }
 
 // ---------------------------------------------------------------------------
+// AggregateReview (#1392) — parent-task cheap-checks trigger + auto-skip verdict
+// ---------------------------------------------------------------------------
+//
+// Native port of ax/backlogist/core/commands.py::cmd_aggregate_review's
+// server-portable path: DB reads + trivial-cluster gate + auto-skip verdict tx.
+// The non-trivial branch (Python `backlogist.aggregate.checks.run_checks` +
+// evidence write + LLM prompt) stays on the client — 828 lines of check code
+// aren't worth re-implementing in Go for a ~20% speedup on the non-trivial path.
+//
+// Response shape drives the client fork:
+//   - skipped=true:  server auto-recorded task-closure-reviewer PASS via paired
+//                    audit_trail (field_changed='aggregate_review_verdict') +
+//                    review_results (is_latest=true) INSERTs so the
+//                    sync_aggregate_on_verdict trigger fires and drives
+//                    aggregate_state -> passed. Client just prints the msg.
+//   - skipped=false: server returned {workflow, children_count, total_cost,
+//                    threshold, cheap_checks}. Client continues with local
+//                    Python cheap_checks + evidence + LLM invocation prompt.
+
+// AggregateReviewResult is the /task/{id}/aggregate-review response payload.
+type AggregateReviewResult struct {
+	TaskID         int      `json:"task_id"`
+	Skipped        bool     `json:"skipped"`
+	Reason         string   `json:"reason,omitempty"`         // skipped=true details
+	Workflow       string   `json:"workflow,omitempty"`       // non-trivial: workflow key used
+	ChildrenCount  int      `json:"children_count"`
+	TotalCost      float64  `json:"total_cost"`
+	CostThreshold  float64  `json:"cost_threshold,omitempty"` // max_cost from yaml
+	CountThreshold int      `json:"count_threshold,omitempty"` // max_count from yaml
+	CheapChecks    []string `json:"cheap_checks,omitempty"`   // non-trivial: names to run client-side
+	VerdictWritten bool     `json:"verdict_written,omitempty"` // true after auto-skip tx commits
+}
+
+// aggregateThreshold is the auto_skip_threshold block in
+// workflows/parent-variant-<workflow>.yaml. Extra keys (like total_deliverable_loc)
+// are ignored — parity with Python which only reads these two.
+type aggregateThreshold struct {
+	TotalChildrenCostUSD float64 `yaml:"total_children_cost_usd"`
+	TotalChildren        int     `yaml:"total_children"`
+}
+
+// parentVariantConfig is the subset of workflows/parent-variant-*.yaml the
+// server actually reads. focus_axes / recommendation_categories are Python-side
+// concerns (LLM prompt scaffolding) — permissively ignored here.
+type parentVariantConfig struct {
+	CheapChecks       []string           `yaml:"cheap_checks"`
+	AutoSkipThreshold aggregateThreshold `yaml:"auto_skip_threshold"`
+}
+
+// loadParentVariantConfig reads workflows/parent-variant-{workflow}.yaml from
+// the server-side ax/ tree. Falls back to parent-variant-default.yaml if the
+// workflow-specific file is missing. Returns an empty config (zero threshold,
+// no checks) if even default is missing — the caller then treats every parent
+// as non-trivial (cost 0 < 0 is false, count > 0 is true). Not fatal.
+func loadParentVariantConfig(workflow string) parentVariantConfig {
+	if strings.TrimSpace(workflow) == "" {
+		workflow = "default"
+	}
+	dir := filepath.Join(axFSRoot, "workflows")
+	specific := filepath.Join(dir, fmt.Sprintf("parent-variant-%s.yaml", workflow))
+	fallback := filepath.Join(dir, "parent-variant-default.yaml")
+
+	var cfg parentVariantConfig
+	for _, p := range []string{specific, fallback} {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		if err := yaml.Unmarshal(data, &cfg); err == nil {
+			return cfg
+		}
+	}
+	return cfg
+}
+
+// BeginAggregateReview runs the server-portable slice of aggregate-review:
+// verify parent, load workflow config, read children, check trivial-cluster
+// threshold, and either auto-record PASS verdict or hand back check names.
+//
+// Trivial-cluster rule (mirrors Python cmd_aggregate_review:3334):
+//   total_cost < max_cost AND len(children) <= max_count AND !force AND !dryRun
+//
+// Auto-skip tx order (critical — sync_aggregate_on_verdict trigger relies on
+// audit_trail correlation window ±1 minute from review_results.reviewed_at,
+// see db.py:748-753):
+//   1. INSERT audit_trail (field_changed='aggregate_review_verdict')
+//   2. UPDATE review_results SET is_latest = FALSE where prior closure-reviewer
+//   3. INSERT review_results (verdict=PASS, is_latest=true, reviewer_model=
+//      'task-closure-reviewer')
+// The trigger then fires on step 3 and drives aggregate_state -> passed.
+func (s *Store) BeginAggregateReview(
+	ctx context.Context, taskID int, agent string, force, dryRun bool,
+) (AggregateReviewResult, error) {
+	if strings.TrimSpace(agent) == "" {
+		return AggregateReviewResult{}, fmt.Errorf("agent required")
+	}
+	task, _, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		return AggregateReviewResult{}, err
+	}
+
+	// Read parent flags from the two aggregate-review-only columns (not on Task).
+	var hasChild bool
+	var aggState string
+	if err := s.pool.QueryRow(ctx,
+		`SELECT has_child, aggregate_state FROM tasks WHERE id = $1`, taskID,
+	).Scan(&hasChild, &aggState); err != nil {
+		return AggregateReviewResult{}, fmt.Errorf("read parent flags: %w", err)
+	}
+	if !hasChild {
+		return AggregateReviewResult{
+			TaskID:  taskID,
+			Skipped: true,
+			Reason:  "not a parent (no children)",
+		}, nil
+	}
+
+	// Best-effort git pull before yaml read — mirror ParseRecommendations pattern.
+	pullCtx, cancelPull := context.WithTimeout(ctx, 5*time.Second)
+	pull := exec.CommandContext(pullCtx, "git", "-C", axFSRoot,
+		"pull", "--rebase", "--autostash", "origin", "main")
+	pull.Env = os.Environ()
+	if out, err := pull.CombinedOutput(); err != nil {
+		log.Printf("git pull %s failed (continuing): %s: %v",
+			axFSRoot, bytes.TrimSpace(out), err)
+	}
+	cancelPull()
+
+	workflow := task.Workflow
+	if workflow == "" {
+		workflow = "default"
+	}
+	cfg := loadParentVariantConfig(workflow)
+
+	// SUM(cost_usd) over children — cost_usd is stored as text in DB (parity with
+	// Python task.cost_usd). Coerce NULL/empty to 0 via COALESCE + ::float8 cast.
+	var totalCost float64
+	var childrenCount int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(*),
+		        COALESCE(SUM(NULLIF(cost_usd, '')::float8), 0)
+		   FROM tasks WHERE parent_task_id = $1`,
+		taskID,
+	).Scan(&childrenCount, &totalCost); err != nil {
+		return AggregateReviewResult{}, fmt.Errorf("aggregate children: %w", err)
+	}
+
+	maxCost := cfg.AutoSkipThreshold.TotalChildrenCostUSD
+	maxCount := cfg.AutoSkipThreshold.TotalChildren
+
+	trivial := totalCost < maxCost && childrenCount <= maxCount
+
+	// Non-trivial path OR --force OR --dry-run: return check info so client
+	// continues with local cheap_checks + evidence + LLM prompt.
+	if !trivial || force || dryRun {
+		return AggregateReviewResult{
+			TaskID:         taskID,
+			Skipped:        false,
+			Workflow:       workflow,
+			ChildrenCount:  childrenCount,
+			TotalCost:      totalCost,
+			CostThreshold:  maxCost,
+			CountThreshold: maxCount,
+			CheapChecks:    cfg.CheapChecks,
+		}, nil
+	}
+
+	// Trivial path — auto-skip: record PASS verdict via paired inserts.
+	reason := fmt.Sprintf("trivial: cost $%.2f, %d children", totalCost, childrenCount)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return AggregateReviewResult{}, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// (1) audit_trail FIRST — sync_aggregate_state's trigger correlates
+	// ±1 minute BETWEEN review_results.reviewed_at, so the audit row must be
+	// visible when the review_results row commits.
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO audit_trail (task_id, agent, field_changed, old_value, new_value, command, timestamp)
+		 VALUES ($1, $2, 'aggregate_review_verdict', '', 'PASS', 'aggregate-review', NOW()::text)`,
+		taskID, agent,
+	); err != nil {
+		return AggregateReviewResult{}, fmt.Errorf("insert audit: %w", err)
+	}
+
+	// (2) UPDATE prior closure-reviewer rows to is_latest=FALSE.
+	if _, err := tx.Exec(ctx,
+		`UPDATE review_results SET is_latest = FALSE
+		  WHERE task_id = $1 AND reviewer_model = 'task-closure-reviewer'`,
+		taskID,
+	); err != nil {
+		return AggregateReviewResult{}, fmt.Errorf("mark prior not-latest: %w", err)
+	}
+
+	// (3) INSERT new task-closure-reviewer PASS row. sync_aggregate_on_verdict_trigger
+	// fires here, correlates via audit_trail, drives aggregate_state.
+	summary := fmt.Sprintf("aggregate auto-skip (%s)", reason)
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO review_results
+		     (task_id, verdict, summary, coverage_score, reviewed_at,
+		      reviewer_model, cost_usd, is_latest)
+		 VALUES ($1, 'PASS', $2, 0, NOW()::text, 'task-closure-reviewer', 0.0, TRUE)`,
+		taskID, summary,
+	); err != nil {
+		return AggregateReviewResult{}, fmt.Errorf("insert review_results: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return AggregateReviewResult{}, fmt.Errorf("commit: %w", err)
+	}
+	if s.cache != nil {
+		s.cache.Bump()
+	}
+	return AggregateReviewResult{
+		TaskID:         taskID,
+		Skipped:        true,
+		Reason:         reason,
+		Workflow:       workflow,
+		ChildrenCount:  childrenCount,
+		TotalCost:      totalCost,
+		CostThreshold:  maxCost,
+		CountThreshold: maxCount,
+		VerdictWritten: true,
+	}, nil
+}
+
+// ---------------------------------------------------------------------------
 // Session close audit (#1390) — audit_trail row per DONE task in a session
 // ---------------------------------------------------------------------------
 
