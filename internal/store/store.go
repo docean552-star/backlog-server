@@ -3637,3 +3637,275 @@ func (s *Store) RecordSessionClose(ctx context.Context, agent string, sessionLab
 		Timestamp:    ts,
 	}, nil
 }
+
+// SprintSummary is a single row for GET /sprint/list.
+type SprintSummary struct {
+	ID        int    `json:"id"`
+	Name      string `json:"name"`
+	Deadline  string `json:"deadline"`
+	CreatedAt string `json:"created_at"`
+	ClosedAt  string `json:"closed_at,omitempty"`
+	Status    string `json:"status"`
+	TaskCount int    `json:"task_count"`
+}
+
+// SprintDetail is the payload of GET /sprint/{id} and POST /sprint/*.
+type SprintDetail struct {
+	SprintSummary
+	Tasks []int `json:"tasks"`
+}
+
+// SprintCreateResult is returned by POST /sprint/create.
+type SprintCreateResult struct {
+	SprintDetail
+	AddedTasks   []int `json:"added_tasks,omitempty"`
+	SkippedTasks []int `json:"skipped_tasks,omitempty"`
+}
+
+// SprintAddResult is returned by POST /sprint/{id}/add.
+type SprintAddResult struct {
+	SprintID     int   `json:"sprint_id"`
+	AddedTasks   []int `json:"added_tasks"`
+	SkippedTasks []int `json:"skipped_tasks,omitempty"`
+}
+
+// SprintCloseResult is returned by POST /sprint/{id}/close.
+type SprintCloseResult struct {
+	SprintID  int    `json:"sprint_id"`
+	Status    string `json:"status"`
+	ClosedAt  string `json:"closed_at"`
+	AlreadyClosed bool `json:"already_closed,omitempty"`
+}
+
+// CreateSprint enforces the "one OPEN sprint at a time" invariant, inserts the
+// row, then adds scope tasks in the same transaction. Returns 409-style
+// conflict via ErrSprintOpenExists when another OPEN sprint blocks creation.
+func (s *Store) CreateSprint(ctx context.Context, name, deadline string, scope []int) (SprintCreateResult, error) {
+	name = strings.TrimSpace(name)
+	deadline = strings.TrimSpace(deadline)
+	if name == "" {
+		return SprintCreateResult{}, fmt.Errorf("name required")
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return SprintCreateResult{}, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// One OPEN sprint invariant — mirrors Python cmd_sprint_create.
+	var existingID int
+	var existingName string
+	err = tx.QueryRow(ctx,
+		`SELECT id, name FROM sprints WHERE status = 'OPEN' LIMIT 1`).
+		Scan(&existingID, &existingName)
+	if err == nil {
+		return SprintCreateResult{}, fmt.Errorf(
+			"OPEN sprint #%d '%s' already exists; close it first", existingID, existingName)
+	}
+	if err != nil && err != pgx.ErrNoRows {
+		return SprintCreateResult{}, fmt.Errorf("check existing OPEN: %w", err)
+	}
+
+	var newID int
+	var createdAt string
+	err = tx.QueryRow(ctx,
+		`INSERT INTO sprints (name, deadline, status)
+		 VALUES ($1, $2, 'OPEN')
+		 RETURNING id, created_at`, name, deadline).
+		Scan(&newID, &createdAt)
+	if err != nil {
+		return SprintCreateResult{}, fmt.Errorf("insert sprint: %w", err)
+	}
+
+	added, skipped, err := insertSprintTasksTx(ctx, tx, newID, scope)
+	if err != nil {
+		return SprintCreateResult{}, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return SprintCreateResult{}, fmt.Errorf("commit: %w", err)
+	}
+
+	return SprintCreateResult{
+		SprintDetail: SprintDetail{
+			SprintSummary: SprintSummary{
+				ID: newID, Name: name, Deadline: deadline,
+				CreatedAt: createdAt, Status: "OPEN",
+				TaskCount: len(added),
+			},
+			Tasks: added,
+		},
+		AddedTasks:   added,
+		SkippedTasks: skipped,
+	}, nil
+}
+
+// insertSprintTasksTx adds task IDs to sprint_tasks inside the given tx,
+// skipping IDs that don't exist in tasks or are already members. Returns
+// (addedIDs, skippedIDs, error).
+func insertSprintTasksTx(ctx context.Context, tx pgx.Tx, sprintID int, taskIDs []int) ([]int, []int, error) {
+	added := make([]int, 0, len(taskIDs))
+	skipped := make([]int, 0)
+	if len(taskIDs) == 0 {
+		return added, skipped, nil
+	}
+
+	existing := map[int]bool{}
+	rows, err := tx.Query(ctx, `SELECT id FROM tasks WHERE id = ANY($1)`, taskIDs)
+	if err != nil {
+		return nil, nil, fmt.Errorf("filter tasks: %w", err)
+	}
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, nil, fmt.Errorf("scan task id: %w", err)
+		}
+		existing[id] = true
+	}
+	rows.Close()
+
+	for _, tid := range taskIDs {
+		if !existing[tid] {
+			skipped = append(skipped, tid)
+			continue
+		}
+		ct, err := tx.Exec(ctx,
+			`INSERT INTO sprint_tasks (sprint_id, task_id) VALUES ($1, $2)
+			 ON CONFLICT (sprint_id, task_id) DO NOTHING`, sprintID, tid)
+		if err != nil {
+			return nil, nil, fmt.Errorf("insert sprint_tasks (#%d): %w", tid, err)
+		}
+		if ct.RowsAffected() == 0 {
+			skipped = append(skipped, tid)
+			continue
+		}
+		added = append(added, tid)
+	}
+	return added, skipped, nil
+}
+
+// ListSprints returns all sprints ordered by id DESC. status filter is
+// optional ("", "OPEN", "CLOSED").
+func (s *Store) ListSprints(ctx context.Context, status string) ([]SprintSummary, error) {
+	status = strings.TrimSpace(strings.ToUpper(status))
+	var (
+		rows pgx.Rows
+		err  error
+	)
+	if status == "" {
+		rows, err = s.pool.Query(ctx,
+			`SELECT s.id, s.name, s.deadline, s.created_at, COALESCE(s.closed_at,''), s.status,
+			        (SELECT COUNT(*) FROM sprint_tasks st WHERE st.sprint_id = s.id)
+			 FROM sprints s ORDER BY s.id DESC`)
+	} else {
+		rows, err = s.pool.Query(ctx,
+			`SELECT s.id, s.name, s.deadline, s.created_at, COALESCE(s.closed_at,''), s.status,
+			        (SELECT COUNT(*) FROM sprint_tasks st WHERE st.sprint_id = s.id)
+			 FROM sprints s WHERE s.status = $1 ORDER BY s.id DESC`, status)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query sprints: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]SprintSummary, 0)
+	for rows.Next() {
+		var r SprintSummary
+		if err := rows.Scan(&r.ID, &r.Name, &r.Deadline, &r.CreatedAt, &r.ClosedAt, &r.Status, &r.TaskCount); err != nil {
+			return nil, fmt.Errorf("scan sprint: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+// GetSprint returns full detail with the ordered task list attached. Missing
+// sprint returns ErrNotFound.
+func (s *Store) GetSprint(ctx context.Context, id int) (SprintDetail, error) {
+	var d SprintDetail
+	err := s.pool.QueryRow(ctx,
+		`SELECT s.id, s.name, s.deadline, s.created_at, COALESCE(s.closed_at,''), s.status,
+		        (SELECT COUNT(*) FROM sprint_tasks st WHERE st.sprint_id = s.id)
+		 FROM sprints s WHERE s.id = $1`, id).
+		Scan(&d.ID, &d.Name, &d.Deadline, &d.CreatedAt, &d.ClosedAt, &d.Status, &d.TaskCount)
+	if err == pgx.ErrNoRows {
+		return SprintDetail{}, err
+	}
+	if err != nil {
+		return SprintDetail{}, fmt.Errorf("query sprint: %w", err)
+	}
+
+	trows, err := s.pool.Query(ctx,
+		`SELECT task_id FROM sprint_tasks WHERE sprint_id = $1 ORDER BY added_at, task_id`, id)
+	if err != nil {
+		return SprintDetail{}, fmt.Errorf("query sprint_tasks: %w", err)
+	}
+	defer trows.Close()
+	tasks := make([]int, 0)
+	for trows.Next() {
+		var tid int
+		if err := trows.Scan(&tid); err != nil {
+			return SprintDetail{}, fmt.Errorf("scan task_id: %w", err)
+		}
+		tasks = append(tasks, tid)
+	}
+	d.Tasks = tasks
+	return d, nil
+}
+
+// CloseSprint flips status to CLOSED and stamps closed_at. Idempotent: a
+// second call returns AlreadyClosed=true with the original closed_at.
+func (s *Store) CloseSprint(ctx context.Context, id int) (SprintCloseResult, error) {
+	var status, closedAt string
+	err := s.pool.QueryRow(ctx,
+		`SELECT status, COALESCE(closed_at,'') FROM sprints WHERE id = $1`, id).
+		Scan(&status, &closedAt)
+	if err == pgx.ErrNoRows {
+		return SprintCloseResult{}, err
+	}
+	if err != nil {
+		return SprintCloseResult{}, fmt.Errorf("query sprint: %w", err)
+	}
+	if status == "CLOSED" {
+		return SprintCloseResult{
+			SprintID: id, Status: status, ClosedAt: closedAt, AlreadyClosed: true,
+		}, nil
+	}
+	err = s.pool.QueryRow(ctx,
+		`UPDATE sprints SET status = 'CLOSED', closed_at = NOW()::TEXT
+		 WHERE id = $1 RETURNING closed_at`, id).Scan(&closedAt)
+	if err != nil {
+		return SprintCloseResult{}, fmt.Errorf("close sprint: %w", err)
+	}
+	return SprintCloseResult{SprintID: id, Status: "CLOSED", ClosedAt: closedAt}, nil
+}
+
+// AddSprintTasks appends task IDs to an existing sprint. Missing tasks and
+// already-present pairs come back under skipped_tasks.
+func (s *Store) AddSprintTasks(ctx context.Context, sprintID int, taskIDs []int) (SprintAddResult, error) {
+	var exists int
+	err := s.pool.QueryRow(ctx, `SELECT 1 FROM sprints WHERE id = $1`, sprintID).Scan(&exists)
+	if err == pgx.ErrNoRows {
+		return SprintAddResult{}, err
+	}
+	if err != nil {
+		return SprintAddResult{}, fmt.Errorf("query sprint: %w", err)
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return SprintAddResult{}, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	added, skipped, err := insertSprintTasksTx(ctx, tx, sprintID, taskIDs)
+	if err != nil {
+		return SprintAddResult{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return SprintAddResult{}, fmt.Errorf("commit: %w", err)
+	}
+	return SprintAddResult{SprintID: sprintID, AddedTasks: added, SkippedTasks: skipped}, nil
+}

@@ -1044,3 +1044,135 @@ func (s *Server) handleSessionClose(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, res)
 }
+
+// handleSprintCreate — POST /sprint/create (#1438).
+//
+// Body: {name, deadline?, scope?[]}. Enforces one-OPEN invariant server-side
+// (mirrors Python cmd_sprint_create). scope task IDs are added inline via
+// same-tx INSERT into sprint_tasks; missing task IDs come back under
+// skipped_tasks (non-fatal).
+//
+// 200: SprintCreateResult.
+// 400: name missing or an OPEN sprint already exists.
+// 500: DB failure mid-transaction.
+func (s *Server) handleSprintCreate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name     string `json:"name"`
+		Deadline string `json:"deadline"`
+		Scope    []int  `json:"scope"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	res, err := s.store.CreateSprint(ctx, req.Name, req.Deadline, req.Scope)
+	if err != nil {
+		msg := err.Error()
+		if strings.HasPrefix(msg, "name required") || strings.HasPrefix(msg, "OPEN sprint #") {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": msg})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// handleSprintList — GET /sprint/list (#1438).
+//
+// Query params: ?status=OPEN|CLOSED (optional). Returns array ordered by
+// id DESC with task_count populated per sprint.
+func (s *Server) handleSprintList(w http.ResponseWriter, r *http.Request) {
+	status := r.URL.Query().Get("status")
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	res, err := s.store.ListSprints(ctx, status)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"sprints": res, "count": len(res)})
+}
+
+// handleSprintGet — GET /sprint/{id} (#1438).
+//
+// Returns SprintDetail with the ordered task list attached.
+// 404: sprint not found.
+func (s *Server) handleSprintGet(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id must be integer"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	res, err := s.store.GetSprint(ctx, id)
+	if err != nil {
+		if store.IsNotFound(err) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "sprint not found", "id": id})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// handleSprintClose — POST /sprint/{id}/close (#1438).
+//
+// Idempotent: second call returns already_closed=true with the original
+// closed_at timestamp.
+// 404: sprint not found.
+func (s *Server) handleSprintClose(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id must be integer"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	res, err := s.store.CloseSprint(ctx, id)
+	if err != nil {
+		if store.IsNotFound(err) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "sprint not found", "id": id})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// handleSprintAdd — POST /sprint/{id}/add (#1438).
+//
+// Body: {task_ids:[]int}. Appends tasks to an existing sprint (any status).
+// Non-existent task IDs and already-present pairs come back as skipped_tasks.
+// 404: sprint not found.
+func (s *Server) handleSprintAdd(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id must be integer"})
+		return
+	}
+	var req struct {
+		TaskIDs []int `json:"task_ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	res, err := s.store.AddSprintTasks(ctx, id, req.TaskIDs)
+	if err != nil {
+		if store.IsNotFound(err) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "sprint not found", "id": id})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
