@@ -3459,13 +3459,14 @@ func (s *Store) BeginAggregateReview(
 	}
 	cfg := loadParentVariantConfig(workflow)
 
-	// SUM(cost_usd) over children — cost_usd is stored as text in DB (parity with
-	// Python task.cost_usd). Coerce NULL/empty to 0 via COALESCE + ::float8 cast.
+	// SUM(cost_usd) over children — cost_usd is REAL DEFAULT 0. NULL is possible
+	// on rows imported before the DEFAULT was added; COALESCE catches SUM=NULL
+	// (empty aggregate) and NULL cell values in one shot.
 	var totalCost float64
 	var childrenCount int
 	if err := s.pool.QueryRow(ctx,
 		`SELECT COUNT(*),
-		        COALESCE(SUM(NULLIF(cost_usd, '')::float8), 0)
+		        COALESCE(SUM(cost_usd), 0)::float8
 		   FROM tasks WHERE parent_task_id = $1`,
 		taskID,
 	).Scan(&childrenCount, &totalCost); err != nil {
