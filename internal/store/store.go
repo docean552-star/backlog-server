@@ -2954,8 +2954,23 @@ func (s *Store) TriggerSMM(ctx context.Context, job, agent string) (TriggerSMMRe
 	if agent == "" {
 		agent = "unknown"
 	}
-	// Ensure runs dir exists (idempotent — operator should have chown'd it
-	// once at deploy).
+	// Best-effort git pull so the just-pushed scripts/smm-run.sh is on disk
+	// before we exec it. Mirrors proxy.go:121-131 / SubtasksFromPlan pattern;
+	// 5s timeout; errors logged not returned (fall through to whatever is on
+	// disk, we get a spawn error later if the wrapper is truly missing).
+	pullCtx, cancelPull := context.WithTimeout(ctx, 5*time.Second)
+	pull := exec.CommandContext(pullCtx, "git", "-C", axFSRoot,
+		"pull", "--rebase", "--autostash", "origin", "main")
+	pull.Env = os.Environ()
+	if out, err := pull.CombinedOutput(); err != nil {
+		log.Printf("git pull %s failed (continuing): %s: %v",
+			axFSRoot, bytes.TrimSpace(out), err)
+	}
+	cancelPull()
+
+	// Ensure runs dir exists (idempotent — MkdirAll is a no-op if present).
+	// deploy user owns the parent /opt/apps/ax so the subdir inherits deploy
+	// ownership; no chown needed post-first-trigger.
 	if err := os.MkdirAll(smmRunsDir, 0o755); err != nil {
 		return TriggerSMMResult{}, fmt.Errorf("mkdir runs: %w", err)
 	}
