@@ -1,11 +1,14 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -2617,6 +2620,21 @@ func (s *Store) SubtasksFromPlan(ctx context.Context, taskID int, agent string, 
 		}
 		rel = fmt.Sprintf("docs/specs/%s-%d/task_plan.md", owner, taskID)
 	}
+	// Best-effort git pull before reading — the file may have been pushed
+	// moments ago by /prepare-task. Mirrors proxy.go:121-131 for /exec, so
+	// native handlers that read FS see the same freshness guarantees as the
+	// Python proxy path. 5s timeout; errors logged not returned (fall through
+	// to whatever is on disk, still fresher than nothing).
+	pullCtx, cancelPull := context.WithTimeout(ctx, 5*time.Second)
+	pull := exec.CommandContext(pullCtx, "git", "-C", axFSRoot,
+		"pull", "--rebase", "--autostash", "origin", "main")
+	pull.Env = os.Environ()
+	if out, err := pull.CombinedOutput(); err != nil {
+		log.Printf("git pull %s failed (continuing): %s: %v",
+			axFSRoot, bytes.TrimSpace(out), err)
+	}
+	cancelPull()
+
 	full := filepath.Join(axFSRoot, rel)
 	content, err := os.ReadFile(full)
 	if err != nil {
