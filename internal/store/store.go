@@ -527,6 +527,44 @@ func (s *Store) HasLatestVerdict(ctx context.Context, taskID int, reviewer, verd
 	return ok, err
 }
 
+// getRequiredReviews mirrors Python transition_gates._get_required_reviews:
+// priority 1 = custom_fields.required_reviews (CSV set at cmd_take), priority 2
+// = mode-based defaults. Priority 2 (workflow.review_agents lookup) requires
+// porting the workflows config module — deferred; the cache is set at cmd_take
+// for every current task, so P1 hits in practice.
+func (s *Store) getRequiredReviews(ctx context.Context, taskID int, mode string) ([]string, error) {
+	var cfJSON string
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COALESCE(custom_fields, '{}') FROM tasks WHERE id = $1`, taskID,
+	).Scan(&cfJSON); err != nil {
+		return nil, fmt.Errorf("load custom_fields: %w", err)
+	}
+	var cf map[string]any
+	if err := json.Unmarshal([]byte(cfJSON), &cf); err == nil {
+		if raw, ok := cf["required_reviews"].(string); ok && strings.TrimSpace(raw) != "" {
+			parts := strings.Split(raw, ",")
+			out := make([]string, 0, len(parts))
+			for _, p := range parts {
+				if t := strings.TrimSpace(p); t != "" {
+					out = append(out, t)
+				}
+			}
+			if len(out) > 0 {
+				return out, nil
+			}
+		}
+	}
+	// Mode-based defaults (Python parity, transition_gates.py:2392-2398).
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "code":
+		return []string{"code-reviewer", "task-closure-reviewer"}, nil
+	case "think":
+		return []string{"spec-reviewer", "task-closure-reviewer"}, nil
+	default:
+		return []string{"task-closure-reviewer"}, nil
+	}
+}
+
 // AdvanceResult is the payload the /advance handler returns to the client.
 type AdvanceResult struct {
 	Task       Task                 `json:"task"`
@@ -543,16 +581,23 @@ type AdvanceResult struct {
 //
 // Gate coverage (code_task workflow only):
 //   - PLANNING → READY: done_when non-empty + latest spec-reviewer PASS verdict.
+//   - READY → IN_PROGRESS: research_task requires done_when; other workflows
+//     pass server-side (canonical path is `take`, not advance). code_task/smm_task
+//     FS-based checks (test file oracle, task_plan KQ) still live in /exec.
+//   - IN_PROGRESS → IN_REVIEW: latest code-reviewer PASS verdict (load-bearing
+//     DB gate). FS-based checks (git commits mentioning task ID, test file
+//     existence, refactor commit reminder, copy scan) stay in /exec.
+//   - IN_REVIEW → AWAITING_APPROVAL: all required_reviews reviewers have a
+//     latest PASS verdict. required_reviews resolved from custom_fields.
+//     required_reviews (CSV set at cmd_take) with mode-based fallback.
 //   - AWAITING_APPROVAL → DONE: caller must set approve=true (mirrors the CLI's
 //     --approve flag, i.e. operator explicit consent) AND task must have a
 //     latest task-closure-reviewer PASS verdict. Also sets closed_at=NOW().
 //
-// Other transitions (READY→IN_PROGRESS, IN_PROGRESS→IN_REVIEW, IN_REVIEW→
-// AWAITING_APPROVAL) still pass through without server-side gates — client-side
-// checks in Python cmd_advance enforce them. Full parity is a follow-up.
-//
 // File-based checks (research.md content quality, task_plan KQ/TS count, agent
-// markers) remain a client-side concern — the server has no local FS access.
+// markers, git log, test file globs) remain a client-side concern — the server
+// has no local FS access. Native path returning 200 does NOT guarantee full
+// Python parity; callers who want the full check chain can invoke /exec.
 func (s *Store) AdvanceTask(ctx context.Context, taskID int, agent string, approve bool) (AdvanceResult, error) {
 	task, _, err := s.GetTask(ctx, taskID)
 	if err != nil {
@@ -591,6 +636,59 @@ func (s *Store) AdvanceTask(ctx context.Context, taskID int, agent string, appro
 				Check:  "SPEC_REVIEW",
 				Detail: fmt.Sprintf("no latest spec-reviewer PASS verdict. Run @spec-reviewer, then: backlogist review-submit #%d --agent spec-reviewer --verdict PASS", taskID),
 			})
+		}
+	}
+	// READY → IN_PROGRESS: minimal DB gate. Only research_task needs done_when
+	// server-side here (research has no READY→dwell — gate must fire on entry).
+	// For code_task/smm_task, canonical path is `take` (sets IN_PROGRESS + owner
+	// atomically). If someone `advance`s from READY server-side, FS checks
+	// (test_oracle, task_plan KQ) live in /exec — we don't fail-open in a way
+	// that hides them; callers who want the full chain use /exec.
+	if fromStatus == "READY" && to == "IN_PROGRESS" {
+		wf := strings.ToLower(strings.TrimSpace(task.Workflow))
+		if wf == "research_task" && len(task.DoneWhen) == 0 {
+			failures = append(failures, AdvanceGateFailure{
+				Check:  "DONE_WHEN",
+				Detail: fmt.Sprintf("research needs done_when before starting. Run: backlogist #%d update done_when:\"…\"", taskID),
+			})
+		}
+	}
+	// IN_PROGRESS → IN_REVIEW: load-bearing DB gate = latest code-reviewer PASS.
+	// Python also checks git commits, test files, refactor reminder, copy scan
+	// — those stay on /exec (FS/git dependent). Native focuses on the one gate
+	// that can be cleanly resolved from DB alone.
+	if fromStatus == "IN_PROGRESS" && to == "IN_REVIEW" {
+		hasPass, err := s.HasLatestVerdict(ctx, taskID, "code-reviewer", "PASS")
+		if err != nil {
+			return AdvanceResult{}, fmt.Errorf("verdict lookup: %w", err)
+		}
+		if !hasPass {
+			failures = append(failures, AdvanceGateFailure{
+				Check:  "CODE_REVIEW",
+				Detail: fmt.Sprintf("no latest code-reviewer PASS verdict. Run @code-reviewer, then: backlogist review-submit #%d --agent code-reviewer --verdict PASS", taskID),
+			})
+		}
+	}
+	// IN_REVIEW → AWAITING_APPROVAL: all required_reviews reviewers PASS.
+	// required_reviews resolved from custom_fields.required_reviews (CSV set at
+	// cmd_take), with mode-based fallback (Code → code-reviewer + closure;
+	// Think → spec-reviewer + closure; else → closure).
+	if fromStatus == "IN_REVIEW" && to == "AWAITING_APPROVAL" {
+		required, err := s.getRequiredReviews(ctx, taskID, task.Mode)
+		if err != nil {
+			return AdvanceResult{}, err
+		}
+		for _, reviewer := range required {
+			hasPass, err := s.HasLatestVerdict(ctx, taskID, reviewer, "PASS")
+			if err != nil {
+				return AdvanceResult{}, fmt.Errorf("verdict lookup %s: %w", reviewer, err)
+			}
+			if !hasPass {
+				failures = append(failures, AdvanceGateFailure{
+					Check:  "REVIEW",
+					Detail: fmt.Sprintf("%s verdict missing or not PASS. Run @%s, then: backlogist review-submit #%d --agent %s --verdict PASS", reviewer, reviewer, taskID, reviewer),
+				})
+			}
 		}
 	}
 	// AWAITING_APPROVAL → DONE: closure gate. This one is load-bearing — plain
