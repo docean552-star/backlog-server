@@ -872,8 +872,11 @@ func (s *Server) handleParseRecommendations(w http.ResponseWriter, r *http.Reque
 // 500: mkdir/spawn failure (rare — filesystem or wrapper missing).
 func (s *Server) handleSMMTrigger(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Job   string `json:"job"`
-		Agent string `json:"agent"`
+		Job       string `json:"job"`
+		Agent     string `json:"agent"`
+		Client    string `json:"client"`
+		SocialSet string `json:"social_set"`
+		Count     string `json:"count"`
 	}
 	// Body is optional — an empty POST is valid and triggers a pipeline run.
 	if r.ContentLength > 0 {
@@ -884,15 +887,21 @@ func (s *Server) handleSMMTrigger(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Job = strings.TrimSpace(req.Job)
 	req.Agent = strings.TrimSpace(req.Agent)
+	req.Client = strings.TrimSpace(req.Client)
+	req.SocialSet = strings.TrimSpace(req.SocialSet)
+	req.Count = strings.TrimSpace(req.Count)
 	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
 	defer cancel()
-	res, err := s.store.TriggerSMM(ctx, req.Job, req.Agent)
+	res, err := s.store.TriggerSMM(ctx, req.Job, req.Agent, store.TriggerSMMParams{
+		Client: req.Client, SocialSet: req.SocialSet, Count: req.Count,
+	})
 	if err != nil {
-		if strings.HasPrefix(err.Error(), "job must be") {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		msg := err.Error()
+		if strings.HasPrefix(msg, "job must be") || strings.HasPrefix(msg, "params must match") {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg})
 			return
 		}
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": msg})
 		return
 	}
 	writeJSON(w, http.StatusAccepted, res)

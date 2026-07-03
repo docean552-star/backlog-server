@@ -2935,25 +2935,55 @@ type TriggerSMMResult struct {
 	Status string `json:"status"`
 }
 
+// TriggerSMMParams carries the optional per-job parameters. Only content_agent
+// currently consumes them; pipeline/noop ignore. Sensible defaults match
+// the daily-monitor step-5 invocation.
+type TriggerSMMParams struct {
+	Client    string `json:"client,omitempty"`
+	SocialSet string `json:"social_set,omitempty"`
+	Count     string `json:"count,omitempty"`
+}
+
 // TriggerSMM starts a background SMM pipeline run:
 //  1. Assigns a run_id (timestamp + random suffix).
 //  2. Writes state file /opt/apps/ax/runs/<id>.json with status=queued.
-//  3. Forks smm-run.sh <run_id> <job> <agent> via setsid so it survives the
-//     server restarting. Wrapper mutates the state file through the run.
+//  3. Forks smm-run.sh <run_id> <job> <agent> [client social_set count] via
+//     setsid so it survives the server restarting. Wrapper mutates the state
+//     file through the run.
 //
-// job = "pipeline" (full 5-step smm-daily-monitor.sh — MVP scope). "content_agent"
-// (step-5-only) can be added later without protocol change.
+// Jobs:
+//   - "pipeline" — full 5-step smm-daily-monitor.sh. Ignores params.
+//   - "noop" — 3s sleep, exit 0. For smokes. Ignores params.
+//   - "content_agent" — step-5-only. Reads params.Client (default "ayant-x"),
+//     params.SocialSet (default "297027"), params.Count (default "1").
 //
 // agent is recorded in the state file for audit; matches AX_AGENT of the caller.
-func (s *Store) TriggerSMM(ctx context.Context, job, agent string) (TriggerSMMResult, error) {
+func (s *Store) TriggerSMM(ctx context.Context, job, agent string, params TriggerSMMParams) (TriggerSMMResult, error) {
 	if job == "" {
 		job = "pipeline"
 	}
-	if job != "pipeline" && job != "noop" {
-		return TriggerSMMResult{}, fmt.Errorf("job must be 'pipeline' or 'noop' (MVP scope; other jobs deferred)")
+	if job != "pipeline" && job != "noop" && job != "content_agent" {
+		return TriggerSMMResult{}, fmt.Errorf("job must be 'pipeline', 'noop', or 'content_agent'")
 	}
 	if agent == "" {
 		agent = "unknown"
+	}
+	// Params default to daily-monitor step-5 values (client=ayant-x, social_set=297027, count=1).
+	// Sanitise for shell — only allow safe chars in slug/id-shaped values so the
+	// wrapper positional args can't inject via unusual client names.
+	if params.Client == "" {
+		params.Client = "ayant-x"
+	}
+	if params.SocialSet == "" {
+		params.SocialSet = "297027"
+	}
+	if params.Count == "" {
+		params.Count = "1"
+	}
+	// Rejects anything outside [A-Za-z0-9._-].
+	safe := regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+	if !safe.MatchString(params.Client) || !safe.MatchString(params.SocialSet) || !safe.MatchString(params.Count) {
+		return TriggerSMMResult{}, fmt.Errorf("params must match [A-Za-z0-9._-]+")
 	}
 	// Best-effort git pull so the just-pushed scripts/smm-run.sh is on disk
 	// before we exec it. Mirrors proxy.go:121-131 / SubtasksFromPlan pattern;
@@ -2996,7 +3026,8 @@ func (s *Store) TriggerSMM(ctx context.Context, job, agent string) (TriggerSMMRe
 	if err != nil {
 		return TriggerSMMResult{}, fmt.Errorf("create log file: %w", err)
 	}
-	cmd := exec.Command(smmWrapperScript, runID, job, agent)
+	cmd := exec.Command(smmWrapperScript, runID, job, agent,
+		params.Client, params.SocialSet, params.Count)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
