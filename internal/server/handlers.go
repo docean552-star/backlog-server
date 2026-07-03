@@ -1145,6 +1145,25 @@ func (s *Server) handleSprintClose(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+// handleTaskownersCheck — GET /taskowners/check (#1439).
+//
+// Reads /opt/apps/ax/taskowners.yaml server-side, validates the rules against
+// the Owner whitelist, and computes coverage against the last 50 DONE tasks
+// (6 pattern types: tags/consumers/mode/title_contains/owner/status).
+// Missing file → 200 with rules_count=0 + friendly note (parity with Python).
+// YAML/schema errors surface via errors[] rather than 400 so the CLI can
+// render the details and exit 1.
+func (s *Server) handleTaskownersCheck(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	res, err := s.store.CheckTaskowners(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
 // handleAgentList — GET /agent/list (#1437).
 //
 // Reads /opt/apps/ax/.claude/agents/*.md server-side, parses YAML frontmatter

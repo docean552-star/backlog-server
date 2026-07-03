@@ -3882,6 +3882,236 @@ func (s *Store) CloseSprint(ctx context.Context, id int) (SprintCloseResult, err
 	return SprintCloseResult{SprintID: id, Status: "CLOSED", ClosedAt: closedAt}, nil
 }
 
+// taskownersPath is where /opt/apps/ax hosts the routing rules yaml.
+// Mirrors Python _get_taskowners_path (PROJECT_ROOT / "taskowners.yaml").
+const taskownersPath = "/opt/apps/ax/taskowners.yaml"
+
+// validOwners is the whitelist from Python's Owner enum
+// (backlogist/core/models.py). Lowercased for case-insensitive compare.
+var validOwners = map[string]bool{
+	"a": true, "b": true, "t1": true, "t2": true, "meta": true,
+	"samvel": true, "roma": true, "agent": true, "angel": true,
+	"seo": true, "smm": true,
+}
+
+// TaskownersRule is one loaded row from taskowners.yaml.
+type TaskownersRule struct {
+	Patterns map[string]interface{} `yaml:"patterns" json:"patterns"`
+	Owner    string                 `yaml:"owner" json:"owner"`
+	Priority int                    `yaml:"priority" json:"priority,omitempty"`
+	Workflow string                 `yaml:"workflow" json:"workflow,omitempty"`
+}
+
+// TaskownersRuleReport is a per-rule row in the coverage table.
+type TaskownersRuleReport struct {
+	Owner       string                 `json:"owner"`
+	Patterns    map[string]interface{} `json:"patterns"`
+	MatchCount  int                    `json:"match_count"`
+}
+
+// UnmatchedTask names a DONE task that no rule claimed.
+type UnmatchedTask struct {
+	ID    int    `json:"id"`
+	Title string `json:"title"`
+	Owner string `json:"owner"`
+	Mode  string `json:"mode"`
+}
+
+// TaskownersCheckResult is the payload for GET /taskowners/check.
+type TaskownersCheckResult struct {
+	RulesCount int                     `json:"rules_count"`
+	Errors     []string                `json:"errors"`
+	Coverage   TaskownersCoverage      `json:"coverage"`
+	PerRule    []TaskownersRuleReport  `json:"per_rule"`
+	Unmatched  []UnmatchedTask         `json:"unmatched"`
+	Note       string                  `json:"note,omitempty"`
+}
+
+// TaskownersCoverage summarises match ratio across the sampled DONE tasks.
+type TaskownersCoverage struct {
+	Matched int `json:"matched"`
+	Total   int `json:"total"`
+	Pct     int `json:"pct"`
+}
+
+// CheckTaskowners loads taskowners.yaml, validates the ruleset, and computes
+// coverage against the last 50 DONE tasks. Missing file → ok result with
+// rules_count=0 + note. YAML/schema errors surface via errors[] (not error
+// return) so the CLI can render them and exit 1.
+func (s *Store) CheckTaskowners(ctx context.Context) (TaskownersCheckResult, error) {
+	data, err := os.ReadFile(taskownersPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return TaskownersCheckResult{
+				RulesCount: 0,
+				Errors:     []string{},
+				PerRule:    []TaskownersRuleReport{},
+				Unmatched:  []UnmatchedTask{},
+				Note:       "no taskowners.yaml found — routing rules empty",
+			}, nil
+		}
+		return TaskownersCheckResult{}, fmt.Errorf("read taskowners.yaml: %w", err)
+	}
+
+	var doc struct {
+		Rules []TaskownersRule `yaml:"rules"`
+	}
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return TaskownersCheckResult{
+			RulesCount: 0,
+			Errors:     []string{fmt.Sprintf("YAML parse error: %v", err)},
+			PerRule:    []TaskownersRuleReport{},
+			Unmatched:  []UnmatchedTask{},
+		}, nil
+	}
+
+	rules := doc.Rules
+	if rules == nil {
+		rules = []TaskownersRule{}
+	}
+	errs := make([]string, 0)
+	for idx, rule := range rules {
+		if strings.TrimSpace(rule.Owner) == "" {
+			errs = append(errs, fmt.Sprintf("rule #%d: missing owner", idx))
+			continue
+		}
+		if !validOwners[strings.ToLower(rule.Owner)] {
+			errs = append(errs, fmt.Sprintf("rule #%d: unknown owner %q (expected one of A/B/T1/T2/meta/samvel/roma/agent/angel/seo/smm)", idx, rule.Owner))
+		}
+	}
+
+	// Even if rule set has errors we still compute coverage — the CLI prints
+	// both blocks. Pull last 50 DONE tasks.
+	type doneTask struct {
+		ID        int
+		Title     string
+		Owner     string
+		Mode      string
+		Tags      []string
+		Consumers []string
+	}
+	tasks := make([]doneTask, 0, 50)
+	trows, err := s.pool.Query(ctx,
+		`SELECT id, COALESCE(title,''), COALESCE(owner,''), COALESCE(mode,''),
+		        COALESCE(tags,'[]'), COALESCE(consumers,'[]')
+		 FROM tasks WHERE status = 'DONE' ORDER BY id DESC LIMIT 50`)
+	if err != nil {
+		return TaskownersCheckResult{}, fmt.Errorf("query DONE tasks: %w", err)
+	}
+	for trows.Next() {
+		var t doneTask
+		var tagsJSON, consJSON string
+		if err := trows.Scan(&t.ID, &t.Title, &t.Owner, &t.Mode, &tagsJSON, &consJSON); err != nil {
+			trows.Close()
+			return TaskownersCheckResult{}, fmt.Errorf("scan DONE row: %w", err)
+		}
+		_ = json.Unmarshal([]byte(tagsJSON), &t.Tags)
+		_ = json.Unmarshal([]byte(consJSON), &t.Consumers)
+		tasks = append(tasks, t)
+	}
+	trows.Close()
+
+	perRule := make([]TaskownersRuleReport, len(rules))
+	for i, rule := range rules {
+		perRule[i] = TaskownersRuleReport{
+			Owner: rule.Owner, Patterns: rule.Patterns, MatchCount: 0,
+		}
+	}
+	unmatched := make([]UnmatchedTask, 0)
+	matched := 0
+
+	for _, task := range tasks {
+		hit := false
+		for i, rule := range rules {
+			if ruleMatchesTask(rule, task.Owner, task.Mode, task.Title, task.Tags, task.Consumers) {
+				perRule[i].MatchCount++
+				matched++
+				hit = true
+				break // first match wins (mirrors Python)
+			}
+		}
+		if !hit {
+			unmatched = append(unmatched, UnmatchedTask{
+				ID: task.ID, Title: task.Title, Owner: task.Owner, Mode: task.Mode,
+			})
+		}
+	}
+
+	pct := 0
+	if len(tasks) > 0 {
+		pct = matched * 100 / len(tasks)
+	}
+	return TaskownersCheckResult{
+		RulesCount: len(rules),
+		Errors:     errs,
+		Coverage:   TaskownersCoverage{Matched: matched, Total: len(tasks), Pct: pct},
+		PerRule:    perRule,
+		Unmatched:  unmatched,
+	}, nil
+}
+
+// ruleMatchesTask returns true when *every* pattern in rule.Patterns is
+// satisfied by the task. Mirrors Python _rule_matches + _field_matches for
+// the 6 supported pattern types (tags/consumers/mode/title_contains/owner/status).
+// An empty pattern set = wildcard (all match).
+func ruleMatchesTask(rule TaskownersRule, taskOwner, taskMode, taskTitle string, taskTags, taskConsumers []string) bool {
+	if len(rule.Patterns) == 0 {
+		return true
+	}
+	for field, expected := range rule.Patterns {
+		if !taskownersFieldMatches(field, expected, taskOwner, taskMode, taskTitle, taskTags, taskConsumers) {
+			return false
+		}
+	}
+	return true
+}
+
+func taskownersFieldMatches(field string, expected interface{}, taskOwner, taskMode, taskTitle string, taskTags, taskConsumers []string) bool {
+	toStr := func(v interface{}) string { return strings.ToLower(fmt.Sprintf("%v", v)) }
+	overlap := func(pool []string, expected interface{}) bool {
+		lower := make([]string, len(pool))
+		for i, p := range pool {
+			lower[i] = strings.ToLower(p)
+		}
+		switch v := expected.(type) {
+		case string:
+			for _, p := range lower {
+				if p == strings.ToLower(v) {
+					return true
+				}
+			}
+			return false
+		case []interface{}:
+			for _, e := range v {
+				es := strings.ToLower(fmt.Sprintf("%v", e))
+				for _, p := range lower {
+					if p == es {
+						return true
+					}
+				}
+			}
+			return false
+		}
+		return false
+	}
+	switch field {
+	case "tags":
+		return overlap(taskTags, expected)
+	case "consumers":
+		return overlap(taskConsumers, expected)
+	case "mode":
+		return strings.EqualFold(taskMode, toStr(expected))
+	case "title_contains":
+		return strings.Contains(strings.ToLower(taskTitle), toStr(expected))
+	case "owner":
+		return strings.EqualFold(taskOwner, toStr(expected))
+	case "status":
+		// Not applicable — coverage is computed only against DONE tasks.
+		return strings.EqualFold("DONE", toStr(expected))
+	}
+	return false
+}
+
 // AgentEntry is one row of GET /agent/list.
 type AgentEntry struct {
 	Name        string `json:"name"`
