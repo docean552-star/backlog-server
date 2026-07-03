@@ -958,3 +958,41 @@ func (s *Server) handleSMMGetReport(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
 }
+
+// handleSessionClose — POST /session/close (#1390).
+//
+// Body: {agent, session_label, done_ids[]}. Writes one audit_trail row per
+// existing DONE task with field_changed='session_close', new_value=session_label,
+// command='session-close'. IDs missing from tasks table come back under
+// skipped_ids for the client to surface (non-fatal — HANDOFF may reference
+// hard-deleted tasks). Empty done_ids returns 200 with inserted=0 (think-only
+// session — the git commit itself is the session record).
+//
+// 200: {session_label, inserted, skipped_ids[], timestamp}.
+// 400: agent missing / invalid body.
+// 500: DB failure mid-transaction.
+func (s *Server) handleSessionClose(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Agent        string `json:"agent"`
+		SessionLabel string `json:"session_label"`
+		DoneIDs      []int  `json:"done_ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+		return
+	}
+	req.Agent = strings.TrimSpace(req.Agent)
+	req.SessionLabel = strings.TrimSpace(req.SessionLabel)
+	if req.Agent == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "agent required"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	res, err := s.store.RecordSessionClose(ctx, req.Agent, req.SessionLabel, req.DoneIDs)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}

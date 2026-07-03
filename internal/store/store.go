@@ -3323,3 +3323,88 @@ func nilIfEmpty(m map[string]string) map[string]string {
 	}
 	return m
 }
+
+// ---------------------------------------------------------------------------
+// Session close audit (#1390) — audit_trail row per DONE task in a session
+// ---------------------------------------------------------------------------
+
+// SessionCloseResult is the return payload of RecordSessionClose.
+type SessionCloseResult struct {
+	SessionLabel string `json:"session_label"`
+	Inserted     int    `json:"inserted"`
+	SkippedIDs   []int  `json:"skipped_ids,omitempty"`
+	Timestamp    string `json:"timestamp"`
+}
+
+// RecordSessionClose writes one audit_trail row per DONE task from a closing
+// session. The row schema requires task_id NOT NULL REFERENCES tasks(id), so
+// we filter to IDs that exist and return the rest under skipped_ids for the
+// client to surface. Empty doneIDs → zero rows (a think-only session leaves
+// no session-close audit trail; that is fine — the git commit itself carries
+// the session record).
+//
+// field_changed='session_close', new_value=<session_label> (e.g. samvel-34),
+// command='session-close'. Query the trail per-task via /task/{id}/history to
+// see "was closed in session samvel-34 at TS".
+func (s *Store) RecordSessionClose(ctx context.Context, agent string, sessionLabel string, doneIDs []int) (SessionCloseResult, error) {
+	if strings.TrimSpace(agent) == "" {
+		return SessionCloseResult{}, fmt.Errorf("agent required")
+	}
+	sessionLabel = strings.TrimSpace(sessionLabel)
+	ts := time.Now().UTC().Format(time.RFC3339)
+	if len(doneIDs) == 0 {
+		return SessionCloseResult{SessionLabel: sessionLabel, Inserted: 0, Timestamp: ts}, nil
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return SessionCloseResult{}, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Filter to task IDs that exist in the tasks table — FK on audit_trail.task_id
+	// would blow up the whole INSERT if any ID is stale (task got hard-deleted
+	// or was mis-parsed from HANDOFF). Skipped IDs come back to the client as a
+	// non-fatal hint, not an error.
+	existing := map[int]bool{}
+	rows, err := tx.Query(ctx, `SELECT id FROM tasks WHERE id = ANY($1)`, doneIDs)
+	if err != nil {
+		return SessionCloseResult{}, fmt.Errorf("filter existing: %w", err)
+	}
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return SessionCloseResult{}, fmt.Errorf("scan id: %w", err)
+		}
+		existing[id] = true
+	}
+	rows.Close()
+
+	inserted := 0
+	skipped := make([]int, 0)
+	for _, tid := range doneIDs {
+		if !existing[tid] {
+			skipped = append(skipped, tid)
+			continue
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO audit_trail (task_id, agent, field_changed, old_value, new_value, command, timestamp)
+			 VALUES ($1, $2, 'session_close', '', $3, 'session-close', NOW()::text)`,
+			tid, agent, sessionLabel,
+		); err != nil {
+			return SessionCloseResult{}, fmt.Errorf("insert audit for #%d: %w", tid, err)
+		}
+		inserted++
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return SessionCloseResult{}, fmt.Errorf("commit: %w", err)
+	}
+	return SessionCloseResult{
+		SessionLabel: sessionLabel,
+		Inserted:     inserted,
+		SkippedIDs:   skipped,
+		Timestamp:    ts,
+	}, nil
+}

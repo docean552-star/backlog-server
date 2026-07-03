@@ -54,6 +54,7 @@ func New(cfg config.Config, st *store.Store) *Server {
 	r.Post("/smm/trigger", s.handleSMMTrigger)
 	r.Get("/smm/runs/{id}", s.handleSMMGetRun)
 	r.Get("/smm/reports/{slug}/{date}", s.handleSMMGetReport)
+	r.Post("/session/close", s.handleSessionClose)
 	r.Post("/knowledge", s.handleKnowledge)
 	r.Patch("/task/{id}", s.handleUpdate)
 	r.Post("/exec", s.handleExec)
