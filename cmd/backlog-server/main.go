@@ -15,6 +15,7 @@ import (
 	"github.com/docean552-star/backlog-server/internal/cache"
 	"github.com/docean552-star/backlog-server/internal/cli"
 	"github.com/docean552-star/backlog-server/internal/config"
+	"github.com/docean552-star/backlog-server/internal/mcp"
 	"github.com/docean552-star/backlog-server/internal/notify"
 	"github.com/docean552-star/backlog-server/internal/server"
 	"github.com/docean552-star/backlog-server/internal/store"
@@ -29,6 +30,10 @@ func main() {
 	case "serve":
 		if err := runServe(); err != nil {
 			log.Fatalf("serve: %v", err)
+		}
+	case "mcp":
+		if err := runMCP(); err != nil {
+			log.Fatalf("mcp: %v", err)
 		}
 	case "-h", "--help", "help":
 		usage()
@@ -46,6 +51,10 @@ func usage() {
 Server mode:
   backlog-server serve                  Run HTTP server on $BACKLOG_HTTP_ADDR (default :8090).
 
+MCP sidecar mode (stdio JSON-RPC 2.0; bridges Claude Code → backlog-server REST):
+  backlog-server mcp                    Read MCP requests from stdin, write responses to stdout.
+                                        Requires: BACKLOG_SERVER_URL, BACKLOG_AGENT_KEY.
+
 Client mode (hits $BACKLOG_SERVER_URL):
   backlog-server next <agent> [--limit=N] [--json]
   backlog-server status [--json]
@@ -60,6 +69,17 @@ Server required: BACKLOG_PG_DSN, BACKLOG_AGENT_KEY.
 Server optional: BACKLOG_HTTP_ADDR (default :8090), BACKLOG_REDIS_URL (enables cache + NOTIFY).
 Client required: BACKLOG_SERVER_URL, BACKLOG_AGENT_KEY.
 `)
+}
+
+func runMCP() error {
+	cfg := config.Load()
+	// Sidecar uses client config (BACKLOG_SERVER_URL + BACKLOG_AGENT_KEY),
+	// same requirements as `backlog-server next`/`status`/etc. Validate
+	// against ModeClient to match the client-CLI subcommands' contract.
+	if err := cfg.Validate(config.ModeClient); err != nil {
+		return err
+	}
+	return mcp.Run(cfg.ServerURL, cfg.AgentKey)
 }
 
 func runServe() error {
