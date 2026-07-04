@@ -90,6 +90,23 @@ func runServe() error {
 	}
 	defer st.Close()
 
+	// #1414 Phase 4: bootstrap TASKOWNERS + workflows registries and inject
+	// into the store. LoadTaskowners returns an empty rule set for a missing
+	// file (Python parity); LoadWorkflows falls back to the hard-coded
+	// code_task chain. A YAML parse error is fatal so we don't start with
+	// a half-configured routing engine — an operator prefers a fail-fast
+	// startup log to a silent misroute.
+	towners, err := config.LoadTaskowners(config.AxRoot)
+	if err != nil {
+		return fmt.Errorf("taskowners load: %w", err)
+	}
+	wflows, err := config.LoadWorkflows(config.AxRoot)
+	if err != nil {
+		return fmt.Errorf("workflows load: %w", err)
+	}
+	st.SetConfigRegistries(towners, wflows)
+	log.Printf("config: taskowners rules=%d, workflows loaded", len(towners.Rules()))
+
 	// Notify subscriber runs only if we have a cache to invalidate.
 	runCtx, cancelRun := context.WithCancel(context.Background())
 	var wg sync.WaitGroup

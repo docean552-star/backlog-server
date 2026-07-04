@@ -29,6 +29,11 @@ func New(cfg config.Config, st *store.Store) *Server {
 	r.Use(authMiddleware(cfg.AgentKey))
 
 	r.Get("/healthz", s.handleHealthz)
+	// POST /tasks (create, #1414) must be registered BEFORE `GET /tasks`
+	// (list) so the method-mux distinguishes cleanly; chi handles both
+	// via method routing on the same path anyway, but keeping create
+	// adjacent to the list makes the read/write pair easy to spot.
+	r.Post("/tasks", s.handleCreate)
 	r.Get("/tasks", s.handleListTasks)
 	r.Get("/task/{id}", s.handleGetTask)
 	r.Get("/task/{id}/history", s.handleHistory)

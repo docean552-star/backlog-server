@@ -41,6 +41,41 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// handleCreate — POST /tasks (#1414 native port of cmd_create).
+//
+// Body: store.CreateTaskRequest. MVP covers ~90% of Python cmd_create;
+// --infer-edges / --check-similar stay on /exec (client dispatcher
+// returns False for those and falls through to _SERVER_EXEC_FORWARD).
+//
+// 200: task created, body {task_id, status, workflow, owner, ...advisories}.
+// 400: malformed JSON / missing agent.
+// 422: one or more validation gates failed (bulk aggregation in failures[]).
+// 500: DB / cross-DB HTTP infrastructure failed.
+func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
+	var req store.CreateTaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
+		return
+	}
+	req.Agent = strings.TrimSpace(req.Agent)
+	if req.Agent == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "agent required"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	res, err := s.store.CreateTask(ctx, req)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if len(res.Failures) > 0 {
+		writeJSON(w, http.StatusUnprocessableEntity, res)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
 func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
 	defer cancel()
