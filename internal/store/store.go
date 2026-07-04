@@ -21,6 +21,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/docean552-star/backlog-server/internal/cache"
+	"github.com/docean552-star/backlog-server/internal/config"
 )
 
 // axFSRoot is the on-disk root of the ax/ checkout that server-side handlers
@@ -49,6 +50,13 @@ var terminalStatuses = map[string]bool{
 type Store struct {
 	pool  *pgxpool.Pool
 	cache *cache.Cache // nil → cache disabled, all reads go straight to PG
+
+	// Config registries injected once at startup via SetConfigRegistries
+	// (see create.go). Zero values are safe — CreateTask falls back to
+	// hard-coded defaults when either is nil (owner_source stays "explicit"
+	// with no TASKOWNERS lookup; workflow derives from mode alone).
+	taskowners *config.TaskownersRegistry
+	workflows  *config.WorkflowRegistry
 }
 
 // New opens a pgx pool against dsn, optionally wired to a cache for read paths.
