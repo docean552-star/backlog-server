@@ -60,11 +60,12 @@ type yamlWorkflowsDoc struct {
 
 // WorkflowRegistry holds a named lookup + reload machinery.
 type WorkflowRegistry struct {
-	dir      string
+	dir       string
 	workflows map[string]Workflow
-	mtime    time.Time
-	mu       sync.RWMutex
-	reloadMu sync.Mutex
+	mtime     time.Time
+	lastPull  time.Time // debounce (same rationale as TaskownersRegistry)
+	mu        sync.RWMutex
+	reloadMu  sync.Mutex
 }
 
 // LoadWorkflows parses workflows.yaml at dir/workflows.yaml once and returns
@@ -187,8 +188,24 @@ func upper(s string) string {
 // Reload: best-effort git pull + mtime + reparse. Same pattern as
 // TaskownersRegistry.Reload.
 func (r *WorkflowRegistry) Reload(ctx context.Context) error {
+	// Debounce fast-path — see TaskownersRegistry.Reload for the full
+	// rationale (network git-pull dwarfs the native latency budget).
+	r.mu.RLock()
+	if time.Since(r.lastPull) < pullDebounce {
+		r.mu.RUnlock()
+		return nil
+	}
+	r.mu.RUnlock()
+
 	r.reloadMu.Lock()
 	defer r.reloadMu.Unlock()
+
+	r.mu.RLock()
+	if time.Since(r.lastPull) < pullDebounce {
+		r.mu.RUnlock()
+		return nil
+	}
+	r.mu.RUnlock()
 
 	pullCtx, cancelPull := context.WithTimeout(ctx, 5*time.Second)
 	pull := exec.CommandContext(pullCtx, "git", "-C", r.dir,
@@ -199,6 +216,9 @@ func (r *WorkflowRegistry) Reload(ctx context.Context) error {
 			r.dir, bytes.TrimSpace(out), err)
 	}
 	cancelPull()
+	r.mu.Lock()
+	r.lastPull = time.Now()
+	r.mu.Unlock()
 
 	fi, err := os.Stat(r.path())
 	if err != nil {

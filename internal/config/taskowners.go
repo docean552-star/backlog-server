@@ -63,12 +63,20 @@ type yamlRule struct {
 // on rules when swapping in the new slice. Zero value is unusable — call
 // LoadTaskowners.
 type TaskownersRegistry struct {
-	dir      string       // absolute path to the ax/ checkout containing taskowners.yaml
-	rules    []OwnerRule  // sorted specificity desc, stable
-	mtime    time.Time    // last stat mtime of taskowners.yaml
-	mu       sync.RWMutex // guards rules + mtime
-	reloadMu sync.Mutex   // single-flight around git-pull + parse
+	dir       string       // absolute path to the ax/ checkout containing taskowners.yaml
+	rules     []OwnerRule  // sorted specificity desc, stable
+	mtime     time.Time    // last stat mtime of taskowners.yaml
+	lastPull  time.Time    // last successful git pull (debounce, skip if <60s)
+	mu        sync.RWMutex // guards rules + mtime + lastPull
+	reloadMu  sync.Mutex   // single-flight around git-pull + parse
 }
+
+// pullDebounce caps the git-pull frequency. Each POST /tasks calls Reload,
+// but pulling on every request adds ~1s of network round-trip that dwarfs
+// the 100-200ms native latency target. 60s debounce is generous — freshly
+// pushed rules take at most a minute to appear, and a manual `SIGHUP`
+// path is a follow-up ticket if the operator ever needs zero-lag reload.
+const pullDebounce = 60 * time.Second
 
 // LoadTaskowners parses taskowners.yaml from dir once and returns the
 // registry ready for MatchRule calls. Missing file → empty rule set (no
@@ -169,8 +177,29 @@ func coerceStringList(v any) []string {
 // and continue on failure so a stale origin never wedges the request.
 // Under single-flight (reloadMu) N concurrent creates share one pull+parse.
 func (r *TaskownersRegistry) Reload(ctx context.Context) error {
+	// Fast-path: if a git pull ran within the debounce window, skip both
+	// the git call AND the mtime stat. This is what keeps POST /tasks
+	// on the 100-200ms native budget instead of paying 1-2s of network
+	// per request. Any mtime bump that arrived out of band still gets
+	// picked up at the next post-debounce request.
+	r.mu.RLock()
+	recentPull := time.Since(r.lastPull) < pullDebounce
+	r.mu.RUnlock()
+	if recentPull {
+		return nil
+	}
+
 	r.reloadMu.Lock()
 	defer r.reloadMu.Unlock()
+
+	// Re-check debounce under the reload lock — another goroutine may
+	// have just refreshed while we were queued.
+	r.mu.RLock()
+	if time.Since(r.lastPull) < pullDebounce {
+		r.mu.RUnlock()
+		return nil
+	}
+	r.mu.RUnlock()
 
 	// Best-effort git pull. Same three log-format strings as SubtasksFromPlan
 	// so log-scrapers (DOC_SYSTEM/scripts/build-lint.py) stay unaffected.
@@ -183,6 +212,11 @@ func (r *TaskownersRegistry) Reload(ctx context.Context) error {
 			r.dir, bytes.TrimSpace(out), err)
 	}
 	cancelPull()
+	// Mark lastPull even on failure — we still don't want to hammer the
+	// remote on a broken origin. Next debounce window will retry.
+	r.mu.Lock()
+	r.lastPull = time.Now()
+	r.mu.Unlock()
 
 	// mtime guard — skip full reparse when nothing changed.
 	fi, err := os.Stat(r.path())
