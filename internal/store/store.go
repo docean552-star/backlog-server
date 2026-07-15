@@ -510,16 +510,52 @@ var codeTaskAdvanceMap = map[string]string{
 	"AWAITING_APPROVAL": "DONE",
 }
 
-// ComputeAdvanceTarget returns the next status for a code_task advance, or ""
-// if no advance is defined. Non-code workflows (think_task, marketing, seo, …)
-// aren't handled server-side yet — they still go through the /exec subprocess
-// proxy. MVP covers code_task only; the other workflows land in follow-ups.
+// fixAdvanceMap is the fix-workflow lifecycle (#1619):
+// BACKLOG → SCOPED → IN_PROGRESS → IN_REVIEW → AWAITING_APPROVAL → DONE.
+// SCOPED replaces PLANNING+READY of code_task; fix_scope.md is the artifact
+// gate, checked client-side. IN_REVIEW / AWAITING_APPROVAL / DONE reuse the
+// code_task gates verbatim (code-reviewer, required_reviews, approve+closure).
+var fixAdvanceMap = map[string]string{
+	"BACKLOG":           "SCOPED",
+	"SCOPED":            "IN_PROGRESS",
+	"IN_PROGRESS":       "IN_REVIEW",
+	"IN_REVIEW":         "AWAITING_APPROVAL",
+	"AWAITING_APPROVAL": "DONE",
+}
+
+// thinkTaskAdvanceMap is the think_task lifecycle (#1619):
+// BACKLOG → PLANNING → READY → IN_PROGRESS → REVIEW → AWAITING_APPROVAL → DONE.
+// Note REVIEW (not IN_REVIEW) at position 5; gate is content-reviewer PASS
+// (not code-reviewer) — required_reviews resolution in getRequiredReviews.
+var thinkTaskAdvanceMap = map[string]string{
+	"BACKLOG":           "PLANNING",
+	"PLANNING":          "READY",
+	"READY":             "IN_PROGRESS",
+	"IN_PROGRESS":       "REVIEW",
+	"REVIEW":            "AWAITING_APPROVAL",
+	"AWAITING_APPROVAL": "DONE",
+}
+
+// ComputeAdvanceTarget returns the next status for advance, dispatching by
+// workflow. Native server support covers code_task (MVP), fix (#1619), and
+// think_task (#1619). Empty / unknown workflow is treated as code_task for
+// backwards compatibility. Other workflows (marketing, seo, research_task, …)
+// return "" so the client falls back to /exec — the Python CLI has the full
+// stage map. See _preflight_native_advance in backlogist.py for how the
+// client detects unsupported workflows before hitting the server.
 func ComputeAdvanceTarget(currentStatus, workflow string) string {
 	wf := strings.ToLower(strings.TrimSpace(workflow))
-	if wf != "" && wf != "code_task" {
+	current := strings.ToUpper(currentStatus)
+	switch wf {
+	case "", "code_task":
+		return codeTaskAdvanceMap[current]
+	case "fix":
+		return fixAdvanceMap[current]
+	case "think_task":
+		return thinkTaskAdvanceMap[current]
+	default:
 		return ""
 	}
-	return codeTaskAdvanceMap[strings.ToUpper(currentStatus)]
 }
 
 // HasLatestVerdict returns true iff a review_results row exists for this task
@@ -542,10 +578,16 @@ func (s *Store) HasLatestVerdict(ctx context.Context, taskID int, reviewer, verd
 
 // getRequiredReviews mirrors Python transition_gates._get_required_reviews:
 // priority 1 = custom_fields.required_reviews (CSV set at cmd_take), priority 2
-// = mode-based defaults. Priority 2 (workflow.review_agents lookup) requires
+// = workflow-based defaults, priority 3 = legacy mode-based defaults.
+//
+// Workflow branch (#1619): think_task tasks use content-reviewer (not
+// spec-reviewer / not code-reviewer) — think_task deliverables are
+// documents/specs, reviewed by @content-reviewer. fix + code_task keep
+// code-reviewer. Priority 3 mode branch remains for tasks where workflow is
+// empty (legacy imports). Priority 2 (workflow.review_agents lookup) requires
 // porting the workflows config module — deferred; the cache is set at cmd_take
 // for every current task, so P1 hits in practice.
-func (s *Store) getRequiredReviews(ctx context.Context, taskID int, mode string) ([]string, error) {
+func (s *Store) getRequiredReviews(ctx context.Context, taskID int, workflow, mode string) ([]string, error) {
 	var cfJSON string
 	if err := s.pool.QueryRow(ctx,
 		`SELECT COALESCE(custom_fields, '{}') FROM tasks WHERE id = $1`, taskID,
@@ -567,14 +609,30 @@ func (s *Store) getRequiredReviews(ctx context.Context, taskID int, mode string)
 			}
 		}
 	}
-	// Mode-based defaults (Python parity, transition_gates.py:2392-2398).
+	return defaultReviewers(workflow, mode), nil
+}
+
+// defaultReviewers is the pure decision function used by getRequiredReviews
+// after custom_fields.required_reviews override has been checked. Split out
+// so table-driven tests can exercise the workflow/mode branches without a DB.
+//
+// Workflow branch (#1619): think_task → content-reviewer (docs/specs review);
+// fix + code_task → code-reviewer. Empty workflow falls through to legacy
+// mode-based defaults for pre-workflow imports.
+func defaultReviewers(workflow, mode string) []string {
+	switch strings.ToLower(strings.TrimSpace(workflow)) {
+	case "think_task":
+		return []string{"content-reviewer", "task-closure-reviewer"}
+	case "fix", "code_task":
+		return []string{"code-reviewer", "task-closure-reviewer"}
+	}
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case "code":
-		return []string{"code-reviewer", "task-closure-reviewer"}, nil
+		return []string{"code-reviewer", "task-closure-reviewer"}
 	case "think":
-		return []string{"spec-reviewer", "task-closure-reviewer"}, nil
+		return []string{"content-reviewer", "task-closure-reviewer"}
 	default:
-		return []string{"task-closure-reviewer"}, nil
+		return []string{"task-closure-reviewer"}
 	}
 }
 
@@ -652,6 +710,20 @@ func (s *Store) AdvanceTask(ctx context.Context, taskID int, agent string, appro
 			})
 		}
 	}
+	// BACKLOG → SCOPED (fix workflow only, #1619): done_when non-empty. No
+	// spec-reviewer — fix bypasses PLANNING/prepare pipeline. fix_scope.md is
+	// the FS artifact gate, checked client-side.
+	if fromStatus == "BACKLOG" && to == "SCOPED" {
+		if len(task.DoneWhen) == 0 {
+			failures = append(failures, AdvanceGateFailure{
+				Check:  "DONE_WHEN",
+				Detail: fmt.Sprintf("done_when is empty. Run: backlogist #%d update done_when:\"…\"", taskID),
+			})
+		}
+	}
+	// SCOPED → IN_PROGRESS (fix workflow, #1619): pass-through. fix_scope.md
+	// existence is FS-based, checked client-side. Kept as no-op so the
+	// transition is atomic in audit_trail.
 	// READY → IN_PROGRESS: no DB gate for code_task.
 	// Python's _check_to_in_progress is entirely FS-based (test_oracle git
 	// commits, task_plan KQ parse, brief.md existence per workflow) — none of
@@ -676,12 +748,48 @@ func (s *Store) AdvanceTask(ctx context.Context, taskID int, agent string, appro
 			})
 		}
 	}
+	// IN_PROGRESS → REVIEW (think_task workflow, #1619): content-reviewer PASS
+	// (not code-reviewer — think_task deliverables are docs/specs).
+	if fromStatus == "IN_PROGRESS" && to == "REVIEW" {
+		hasPass, err := s.HasLatestVerdict(ctx, taskID, "content-reviewer", "PASS")
+		if err != nil {
+			return AdvanceResult{}, fmt.Errorf("verdict lookup: %w", err)
+		}
+		if !hasPass {
+			failures = append(failures, AdvanceGateFailure{
+				Check:  "CONTENT_REVIEW",
+				Detail: fmt.Sprintf("no latest content-reviewer PASS verdict. Run @content-reviewer, then: backlogist review-submit #%d --agent content-reviewer --verdict PASS", taskID),
+			})
+		}
+	}
+	// REVIEW → AWAITING_APPROVAL (think_task workflow, #1619): required_reviews
+	// mirror IN_REVIEW → AWAITING_APPROVAL for code_task, just from the
+	// think_task-side stage. Falls back to workflow defaults if custom_fields
+	// has no explicit list (content-reviewer + task-closure-reviewer).
+	if fromStatus == "REVIEW" && to == "AWAITING_APPROVAL" {
+		required, err := s.getRequiredReviews(ctx, taskID, task.Workflow, task.Mode)
+		if err != nil {
+			return AdvanceResult{}, err
+		}
+		for _, reviewer := range required {
+			hasPass, err := s.HasLatestVerdict(ctx, taskID, reviewer, "PASS")
+			if err != nil {
+				return AdvanceResult{}, fmt.Errorf("verdict lookup %s: %w", reviewer, err)
+			}
+			if !hasPass {
+				failures = append(failures, AdvanceGateFailure{
+					Check:  "REVIEW",
+					Detail: fmt.Sprintf("%s verdict missing or not PASS. Run @%s, then: backlogist review-submit #%d --agent %s --verdict PASS", reviewer, reviewer, taskID, reviewer),
+				})
+			}
+		}
+	}
 	// IN_REVIEW → AWAITING_APPROVAL: all required_reviews reviewers PASS.
 	// required_reviews resolved from custom_fields.required_reviews (CSV set at
 	// cmd_take), with mode-based fallback (Code → code-reviewer + closure;
 	// Think → spec-reviewer + closure; else → closure).
 	if fromStatus == "IN_REVIEW" && to == "AWAITING_APPROVAL" {
-		required, err := s.getRequiredReviews(ctx, taskID, task.Mode)
+		required, err := s.getRequiredReviews(ctx, taskID, task.Workflow, task.Mode)
 		if err != nil {
 			return AdvanceResult{}, err
 		}
