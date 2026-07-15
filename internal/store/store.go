@@ -149,6 +149,7 @@ type Task struct {
 	CreatedAt      string   `json:"created_at"`
 	UpdatedAt      string   `json:"updated_at"`
 	ClosedAt       *string  `json:"closed_at"`
+	CustomFields   string   `json:"custom_fields"`
 }
 
 // taskColumns selects effective_score via ::text::float8 so we get Python-equivalent
@@ -159,7 +160,8 @@ type Task struct {
 const taskColumns = `id, title, why, owner, status, mode, workflow, type,
 	effective_score::text::float8 AS effective_score,
 	blocked_by, done_when, "references", task_plan, spec,
-	business_value, note, parent_task_id, created_at, updated_at, closed_at`
+	business_value, note, parent_task_id, created_at, updated_at, closed_at,
+	COALESCE(custom_fields::text, '{}') AS custom_fields`
 
 func scanTask(row pgx.Row) (Task, error) {
 	var t Task
@@ -168,6 +170,7 @@ func scanTask(row pgx.Row) (Task, error) {
 		&t.ID, &t.Title, &t.Why, &t.Owner, &t.Status, &t.Mode, &t.Workflow, &t.Type,
 		&t.EffectiveScore, &blockedByJSON, &doneWhenJSON, &refsJSON, &t.TaskPlan, &t.Spec,
 		&t.BusinessValue, &t.Note, &t.ParentTaskID, &t.CreatedAt, &t.UpdatedAt, &t.ClosedAt,
+		&t.CustomFields,
 	)
 	if err != nil {
 		return Task{}, err
