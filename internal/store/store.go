@@ -857,6 +857,17 @@ func (s *Store) AdvanceTask(ctx context.Context, taskID int, agent string, appro
 	); err != nil {
 		return AdvanceResult{}, fmt.Errorf("insert audit: %w", err)
 	}
+	// #1730: transactional rescore on DONE. Mirrors Python cmd_close's
+	// recalculate_unblocked hook — descendants get blocked_by cleaned and
+	// effective_score recomputed in the SAME transaction, so `backlogist next`
+	// after operator --approve immediately reflects the new ranking. Failure
+	// here rolls back the whole tx (status stays at previous) — better a
+	// visible error than a silent stale-scores state.
+	if to == "DONE" {
+		if err := s.rescoreAfterDone(ctx, tx, taskID); err != nil {
+			return AdvanceResult{}, fmt.Errorf("rescore after DONE: %w", err)
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return AdvanceResult{}, fmt.Errorf("commit: %w", err)
 	}
