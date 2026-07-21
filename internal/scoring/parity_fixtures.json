@@ -1,0 +1,756 @@
+[
+  {
+    "name": "single_task_no_blockers",
+    "release_date": "2026-07-25",
+    "tasks": [
+      {
+        "id": 1,
+        "title": "solo task",
+        "owner": "samvel",
+        "mode": "Code",
+        "status": "READY",
+        "created": "2026-07-21",
+        "why": "",
+        "note": "",
+        "session": "samvel-40",
+        "blocked_by": [],
+        "consumers": [],
+        "priority_override": 0,
+        "task_plan": "",
+        "references": [],
+        "score": null
+      }
+    ],
+    "expected": [
+      {
+        "id": 1,
+        "effective": 11.0,
+        "potential": 11.0,
+        "base": 11.0,
+        "impact_points": 0.0,
+        "subjective": 10.0,
+        "release_bonus": 1,
+        "broken_bonus": 0,
+        "consumers_bonus": 0,
+        "blocker_value": 0.0,
+        "unblocks": 0,
+        "is_blocked": false,
+        "has_spec": false,
+        "type": "feature"
+      }
+    ]
+  },
+  {
+    "name": "single_blocker_done_unblocks_child",
+    "release_date": "2026-07-25",
+    "tasks": [
+      {
+        "id": 100,
+        "title": "parent already done",
+        "owner": "samvel",
+        "mode": "Code",
+        "status": "DONE",
+        "created": "2026-07-21",
+        "why": "",
+        "note": "",
+        "session": "samvel-40",
+        "blocked_by": [],
+        "consumers": [],
+        "priority_override": 0,
+        "task_plan": "",
+        "references": [],
+        "score": null
+      },
+      {
+        "id": 101,
+        "title": "child now unblocked",
+        "owner": "samvel",
+        "mode": "Code",
+        "status": "READY",
+        "created": "2026-07-21",
+        "why": "",
+        "note": "",
+        "session": "samvel-40",
+        "blocked_by": [],
+        "consumers": [],
+        "priority_override": 0,
+        "task_plan": "",
+        "references": [],
+        "score": null
+      }
+    ],
+    "expected": [
+      {
+        "id": 100,
+        "effective": 11.0,
+        "potential": 11.0,
+        "base": 11.0,
+        "impact_points": 0.0,
+        "subjective": 10.0,
+        "release_bonus": 1,
+        "broken_bonus": 0,
+        "consumers_bonus": 0,
+        "blocker_value": 0.0,
+        "unblocks": 0,
+        "is_blocked": false,
+        "has_spec": false,
+        "type": "feature"
+      },
+      {
+        "id": 101,
+        "effective": 11.0,
+        "potential": 11.0,
+        "base": 11.0,
+        "impact_points": 0.0,
+        "subjective": 10.0,
+        "release_bonus": 1,
+        "broken_bonus": 0,
+        "consumers_bonus": 0,
+        "blocker_value": 0.0,
+        "unblocks": 0,
+        "is_blocked": false,
+        "has_spec": false,
+        "type": "feature"
+      }
+    ]
+  },
+  {
+    "name": "multi_blocker_partial",
+    "release_date": "2026-07-25",
+    "tasks": [
+      {
+        "id": 200,
+        "title": "b2 still active",
+        "owner": "samvel",
+        "mode": "Code",
+        "status": "READY",
+        "created": "2026-07-21",
+        "why": "",
+        "note": "",
+        "session": "samvel-40",
+        "blocked_by": [],
+        "consumers": [],
+        "priority_override": 0,
+        "task_plan": "",
+        "references": [],
+        "score": null
+      },
+      {
+        "id": 201,
+        "title": "child still blocked",
+        "owner": "samvel",
+        "mode": "Code",
+        "status": "READY",
+        "created": "2026-07-21",
+        "why": "",
+        "note": "",
+        "session": "samvel-40",
+        "blocked_by": [
+          200
+        ],
+        "consumers": [],
+        "priority_override": 0,
+        "task_plan": "",
+        "references": [],
+        "score": null
+      }
+    ],
+    "expected": [
+      {
+        "id": 200,
+        "effective": 14.3,
+        "potential": 14.3,
+        "base": 11.0,
+        "impact_points": 0.0,
+        "subjective": 10.0,
+        "release_bonus": 1,
+        "broken_bonus": 0,
+        "consumers_bonus": 0,
+        "blocker_value": 3.3,
+        "unblocks": 1,
+        "is_blocked": false,
+        "has_spec": false,
+        "type": "feature"
+      },
+      {
+        "id": 201,
+        "effective": 0.0,
+        "potential": 11.0,
+        "base": 11.0,
+        "impact_points": 0.0,
+        "subjective": 10.0,
+        "release_bonus": 1,
+        "broken_bonus": 0,
+        "consumers_bonus": 0,
+        "blocker_value": 0.0,
+        "unblocks": 0,
+        "is_blocked": true,
+        "has_spec": false,
+        "type": "feature"
+      }
+    ]
+  },
+  {
+    "name": "chain_a_b_c",
+    "release_date": "2026-07-25",
+    "tasks": [
+      {
+        "id": 300,
+        "title": "A end of chain",
+        "owner": "samvel",
+        "mode": "Code",
+        "status": "READY",
+        "created": "2026-07-21",
+        "why": "",
+        "note": "",
+        "session": "samvel-40",
+        "blocked_by": [],
+        "consumers": [],
+        "priority_override": 0,
+        "task_plan": "",
+        "references": [],
+        "score": null
+      },
+      {
+        "id": 301,
+        "title": "B middle",
+        "owner": "samvel",
+        "mode": "Code",
+        "status": "READY",
+        "created": "2026-07-21",
+        "why": "",
+        "note": "",
+        "session": "samvel-40",
+        "blocked_by": [
+          300
+        ],
+        "consumers": [],
+        "priority_override": 0,
+        "task_plan": "",
+        "references": [],
+        "score": null
+      },
+      {
+        "id": 302,
+        "title": "C top",
+        "owner": "samvel",
+        "mode": "Code",
+        "status": "READY",
+        "created": "2026-07-21",
+        "why": "",
+        "note": "",
+        "session": "samvel-40",
+        "blocked_by": [
+          301
+        ],
+        "consumers": [],
+        "priority_override": 0,
+        "task_plan": "",
+        "references": [],
+        "score": null
+      }
+    ],
+    "expected": [
+      {
+        "id": 300,
+        "effective": 15.3,
+        "potential": 15.3,
+        "base": 11.0,
+        "impact_points": 0.0,
+        "subjective": 10.0,
+        "release_bonus": 1,
+        "broken_bonus": 0,
+        "consumers_bonus": 0,
+        "blocker_value": 4.3,
+        "unblocks": 1,
+        "is_blocked": false,
+        "has_spec": false,
+        "type": "feature"
+      },
+      {
+        "id": 301,
+        "effective": 0.0,
+        "potential": 14.3,
+        "base": 11.0,
+        "impact_points": 0.0,
+        "subjective": 10.0,
+        "release_bonus": 1,
+        "broken_bonus": 0,
+        "consumers_bonus": 0,
+        "blocker_value": 3.3,
+        "unblocks": 1,
+        "is_blocked": true,
+        "has_spec": false,
+        "type": "feature"
+      },
+      {
+        "id": 302,
+        "effective": 0.0,
+        "potential": 11.0,
+        "base": 11.0,
+        "impact_points": 0.0,
+        "subjective": 10.0,
+        "release_bonus": 1,
+        "broken_bonus": 0,
+        "consumers_bonus": 0,
+        "blocker_value": 0.0,
+        "unblocks": 0,
+        "is_blocked": true,
+        "has_spec": false,
+        "type": "feature"
+      }
+    ]
+  },
+  {
+    "name": "cycle_a_b",
+    "release_date": "2026-07-25",
+    "tasks": [
+      {
+        "id": 400,
+        "title": "A cycle",
+        "owner": "samvel",
+        "mode": "Code",
+        "status": "READY",
+        "created": "2026-07-21",
+        "why": "",
+        "note": "",
+        "session": "samvel-40",
+        "blocked_by": [
+          401
+        ],
+        "consumers": [],
+        "priority_override": 0,
+        "task_plan": "",
+        "references": [],
+        "score": null
+      },
+      {
+        "id": 401,
+        "title": "B cycle",
+        "owner": "samvel",
+        "mode": "Code",
+        "status": "READY",
+        "created": "2026-07-21",
+        "why": "",
+        "note": "",
+        "session": "samvel-40",
+        "blocked_by": [
+          400
+        ],
+        "consumers": [],
+        "priority_override": 0,
+        "task_plan": "",
+        "references": [],
+        "score": null
+      }
+    ],
+    "expected": [
+      {
+        "id": 400,
+        "effective": 0.0,
+        "potential": 11.0,
+        "base": 11.0,
+        "impact_points": 0.0,
+        "subjective": 10.0,
+        "release_bonus": 1,
+        "broken_bonus": 0,
+        "consumers_bonus": 0,
+        "blocker_value": 0.0,
+        "unblocks": 1,
+        "is_blocked": true,
+        "has_spec": false,
+        "type": "feature"
+      },
+      {
+        "id": 401,
+        "effective": 0.0,
+        "potential": 11.0,
+        "base": 11.0,
+        "impact_points": 0.0,
+        "subjective": 10.0,
+        "release_bonus": 1,
+        "broken_bonus": 0,
+        "consumers_bonus": 0,
+        "blocker_value": 0.0,
+        "unblocks": 1,
+        "is_blocked": true,
+        "has_spec": false,
+        "type": "feature"
+      }
+    ]
+  },
+  {
+    "name": "self_loop_a",
+    "release_date": "2026-07-25",
+    "tasks": [
+      {
+        "id": 500,
+        "title": "A self loop",
+        "owner": "samvel",
+        "mode": "Code",
+        "status": "READY",
+        "created": "2026-07-21",
+        "why": "",
+        "note": "",
+        "session": "samvel-40",
+        "blocked_by": [
+          500
+        ],
+        "consumers": [],
+        "priority_override": 0,
+        "task_plan": "",
+        "references": [],
+        "score": null
+      }
+    ],
+    "expected": [
+      {
+        "id": 500,
+        "effective": 0.0,
+        "potential": 11.0,
+        "base": 11.0,
+        "impact_points": 0.0,
+        "subjective": 10.0,
+        "release_bonus": 1,
+        "broken_bonus": 0,
+        "consumers_bonus": 0,
+        "blocker_value": 0.0,
+        "unblocks": 1,
+        "is_blocked": true,
+        "has_spec": false,
+        "type": "feature"
+      }
+    ]
+  },
+  {
+    "name": "dial_driven_impact_points",
+    "release_date": "2026-07-25",
+    "tasks": [
+      {
+        "id": 600,
+        "title": "dial impact test",
+        "owner": "samvel",
+        "mode": "Code",
+        "status": "READY",
+        "created": "2026-07-21",
+        "why": "",
+        "note": "",
+        "session": "samvel-40",
+        "blocked_by": [],
+        "consumers": [],
+        "priority_override": 0,
+        "task_plan": "",
+        "references": [],
+        "score": {
+          "impact": 5,
+          "confidence": 5,
+          "ease": 5,
+          "dependency": 0,
+          "total": 0
+        }
+      }
+    ],
+    "expected": [
+      {
+        "id": 600,
+        "effective": 34.3,
+        "potential": 34.3,
+        "base": 34.3,
+        "impact_points": 20,
+        "subjective": 13.3,
+        "release_bonus": 1,
+        "broken_bonus": 0,
+        "consumers_bonus": 0,
+        "blocker_value": 0.0,
+        "unblocks": 0,
+        "is_blocked": false,
+        "has_spec": false,
+        "type": "fix"
+      }
+    ]
+  },
+  {
+    "name": "broken_bonus_title_keyword",
+    "release_date": "2026-07-25",
+    "tasks": [
+      {
+        "id": 700,
+        "title": "critical fix login crash bug",
+        "owner": "samvel",
+        "mode": "Code",
+        "status": "READY",
+        "created": "2026-07-21",
+        "why": "",
+        "note": "",
+        "session": "samvel-40",
+        "blocked_by": [],
+        "consumers": [],
+        "priority_override": 0,
+        "task_plan": "",
+        "references": [],
+        "score": null
+      }
+    ],
+    "expected": [
+      {
+        "id": 700,
+        "effective": 29.3,
+        "potential": 29.3,
+        "base": 29.3,
+        "impact_points": 0.0,
+        "subjective": 13.3,
+        "release_bonus": 1,
+        "broken_bonus": 15,
+        "consumers_bonus": 0,
+        "blocker_value": 0.0,
+        "unblocks": 0,
+        "is_blocked": false,
+        "has_spec": false,
+        "type": "fix"
+      }
+    ]
+  },
+  {
+    "name": "consumers_bonus_capped",
+    "release_date": "2026-07-25",
+    "tasks": [
+      {
+        "id": 800,
+        "title": "many consumers",
+        "owner": "samvel",
+        "mode": "Code",
+        "status": "READY",
+        "created": "2026-07-21",
+        "why": "",
+        "note": "",
+        "session": "samvel-40",
+        "blocked_by": [],
+        "consumers": [
+          "c1",
+          "c2",
+          "c3",
+          "c4",
+          "c5",
+          "c6",
+          "c7",
+          "c8",
+          "c9",
+          "c10"
+        ],
+        "priority_override": 0,
+        "task_plan": "",
+        "references": [],
+        "score": null
+      }
+    ],
+    "expected": [
+      {
+        "id": 800,
+        "effective": 26.0,
+        "potential": 26.0,
+        "base": 26.0,
+        "impact_points": 0.0,
+        "subjective": 10.0,
+        "release_bonus": 1,
+        "broken_bonus": 0,
+        "consumers_bonus": 15,
+        "blocker_value": 0.0,
+        "unblocks": 0,
+        "is_blocked": false,
+        "has_spec": false,
+        "type": "feature"
+      }
+    ]
+  },
+  {
+    "name": "release_bonus_sprint",
+    "release_date": "2026-07-25",
+    "tasks": [
+      {
+        "id": 900,
+        "title": "sprint task",
+        "owner": "samvel",
+        "mode": "Code",
+        "status": "READY",
+        "created": "2026-03-20",
+        "why": "",
+        "note": "",
+        "session": "meta-50",
+        "blocked_by": [],
+        "consumers": [],
+        "priority_override": 0,
+        "task_plan": "",
+        "references": [],
+        "score": null
+      }
+    ],
+    "expected": [
+      {
+        "id": 900,
+        "effective": 11.0,
+        "potential": 11.0,
+        "base": 11.0,
+        "impact_points": 0.0,
+        "subjective": 10.0,
+        "release_bonus": 1,
+        "broken_bonus": 0,
+        "consumers_bonus": 0,
+        "blocker_value": 0.0,
+        "unblocks": 0,
+        "is_blocked": false,
+        "has_spec": false,
+        "type": "feature"
+      }
+    ]
+  },
+  {
+    "name": "priority_override",
+    "release_date": "2026-07-25",
+    "tasks": [
+      {
+        "id": 1000,
+        "title": "priority pushed",
+        "owner": "samvel",
+        "mode": "Code",
+        "status": "READY",
+        "created": "2026-07-21",
+        "why": "",
+        "note": "",
+        "session": "samvel-40",
+        "blocked_by": [],
+        "consumers": [],
+        "priority_override": 10,
+        "task_plan": "",
+        "references": [],
+        "score": null
+      }
+    ],
+    "expected": [
+      {
+        "id": 1000,
+        "effective": 21.0,
+        "potential": 21.0,
+        "base": 21.0,
+        "impact_points": 0.0,
+        "subjective": 10.0,
+        "release_bonus": 1,
+        "broken_bonus": 0,
+        "consumers_bonus": 0,
+        "blocker_value": 0.0,
+        "unblocks": 0,
+        "is_blocked": false,
+        "has_spec": false,
+        "type": "feature"
+      }
+    ]
+  },
+  {
+    "name": "realistic_parent_children",
+    "release_date": "2026-07-25",
+    "tasks": [
+      {
+        "id": 1100,
+        "title": "parent P",
+        "owner": "samvel",
+        "mode": "Code",
+        "status": "READY",
+        "created": "2026-07-21",
+        "why": "",
+        "note": "",
+        "session": "samvel-40",
+        "blocked_by": [],
+        "consumers": [],
+        "priority_override": 0,
+        "task_plan": "",
+        "references": [],
+        "score": null
+      },
+      {
+        "id": 1101,
+        "title": "child A blocked",
+        "owner": "samvel",
+        "mode": "Code",
+        "status": "READY",
+        "created": "2026-07-21",
+        "why": "",
+        "note": "",
+        "session": "samvel-40",
+        "blocked_by": [
+          1100
+        ],
+        "consumers": [],
+        "priority_override": 0,
+        "task_plan": "",
+        "references": [],
+        "score": null
+      },
+      {
+        "id": 1102,
+        "title": "child B free",
+        "owner": "samvel",
+        "mode": "Code",
+        "status": "READY",
+        "created": "2026-07-21",
+        "why": "",
+        "note": "",
+        "session": "samvel-40",
+        "blocked_by": [],
+        "consumers": [],
+        "priority_override": 0,
+        "task_plan": "",
+        "references": [],
+        "score": null
+      }
+    ],
+    "expected": [
+      {
+        "id": 1100,
+        "effective": 14.3,
+        "potential": 14.3,
+        "base": 11.0,
+        "impact_points": 0.0,
+        "subjective": 10.0,
+        "release_bonus": 1,
+        "broken_bonus": 0,
+        "consumers_bonus": 0,
+        "blocker_value": 3.3,
+        "unblocks": 1,
+        "is_blocked": false,
+        "has_spec": false,
+        "type": "feature"
+      },
+      {
+        "id": 1101,
+        "effective": 0.0,
+        "potential": 11.0,
+        "base": 11.0,
+        "impact_points": 0.0,
+        "subjective": 10.0,
+        "release_bonus": 1,
+        "broken_bonus": 0,
+        "consumers_bonus": 0,
+        "blocker_value": 0.0,
+        "unblocks": 0,
+        "is_blocked": true,
+        "has_spec": false,
+        "type": "feature"
+      },
+      {
+        "id": 1102,
+        "effective": 11.0,
+        "potential": 11.0,
+        "base": 11.0,
+        "impact_points": 0.0,
+        "subjective": 10.0,
+        "release_bonus": 1,
+        "broken_bonus": 0,
+        "consumers_bonus": 0,
+        "blocker_value": 0.0,
+        "unblocks": 0,
+        "is_blocked": false,
+        "has_spec": false,
+        "type": "feature"
+      }
+    ]
+  }
+]
